@@ -8,6 +8,10 @@ import numpy as np
 from plain_memory.config import EmbeddingConfig
 
 
+RETRY_ATTEMPTS = 5
+RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+
+
 class EmbeddingError(Exception):
     def __init__(self, message: str, status: int = 503):
         super().__init__(message)
@@ -48,6 +52,31 @@ class HTTPEmbedder:
     def close(self):
         self.client.close()
 
+    def _post(self, payload: dict, deadline: float) -> httpx.Response:
+        """对供应商限流/瞬时故障做有界退避重试，总时间不超过服务截止时间。"""
+        delay = 1.0
+        for attempt in range(RETRY_ATTEMPTS):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise EmbeddingError("Embedding request exceeded the service deadline.")
+            try:
+                response = self.client.post(
+                    self.url,
+                    json=payload,
+                    timeout=httpx.Timeout(remaining, connect=min(5.0, remaining)),
+                )
+            except (httpx.TransportError, httpx.TimeoutException):
+                if attempt == RETRY_ATTEMPTS - 1:
+                    raise
+            else:
+                if response.status_code not in RETRYABLE_STATUS or attempt == RETRY_ATTEMPTS - 1:
+                    return response
+            if deadline - time.monotonic() <= delay:
+                raise EmbeddingError("Embedding request exceeded the service deadline.")
+            time.sleep(delay)
+            delay = min(delay * 2, 8.0)
+        raise AssertionError("unreachable")
+
     def embed(self, texts: list[str], deadline: float) -> np.ndarray:
         vectors = []
         batch_size = 1 if self.config.protocol == "doubao_multimodal" else self.config.batch_size
@@ -66,11 +95,7 @@ class HTTPEmbedder:
                 if self.config.dimensions is not None:
                     payload["dimensions"] = self.config.dimensions
             try:
-                response = self.client.post(
-                    self.url,
-                    json=payload,
-                    timeout=httpx.Timeout(remaining, connect=min(5.0, remaining)),
-                )
+                response = self._post(payload, deadline)
                 if response.status_code in (400, 413, 422):
                     raise EmbeddingError(
                         "Embedding provider rejected input; check model limits.", 422

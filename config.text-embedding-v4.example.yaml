@@ -1,5 +1,6 @@
-# Formal model requirement. Endpoint/protocol/limits must be confirmed with your provider.
-# Use a NEW database when switching from the Doubao smoke model.
+# Official open-source-track model: Alibaba Bailian (DashScope) text-embedding-v4.
+# Use a NEW database when switching from any other embedding model.
+# Copy to config.local.yaml (or run scripts/init_config.py --preset text-embedding-v4).
 api_token: "GENERATE_LOCALLY"
 database: "data/text-embedding-v4.sqlite3"
 chunk_tokens: 512
@@ -11,8 +12,8 @@ add_timeout_seconds: 120
 search_timeout_seconds: 30
 embedding:
   protocol: "openai_compatible"
-  base_url: "https://YOUR_PROVIDER/v1"
+  base_url: "https://llm-et2ipodeqk0ea8be.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
   model: "text-embedding-v4"
   api_key: "REPLACE_WITH_YOUR_PROVIDER_KEY"
-  dimensions: null
-  batch_size: 32
+  dimensions: 1024  # text-embedding-v4 default; explicit so the DB identity is stable.
+  batch_size: 10    # DashScope text-embedding-v4 accepts at most 10 inputs per request.

@@ -21,3 +21,5 @@
 同日通过正式地址 `https://plainmemory.de5.net` 完成最终加密公网冒烟测试：健康检查、Bearer 鉴权、同步 Add、Search、幂等重试和用户隔离全部通过。测试时 macOS/Python 在 VPN 切换后出现一次本地 DNS 解析异常；测试进程临时固定到已验证的 Cloudflare Anycast IP，TLS 仍按 `plainmemory.de5.net` 校验证书和主机名。
 
 未验证：text-embedding-v4 调用、Docker 构建、性能容量、官方 AML Smoke/Full。官方评测与材料由用户处理。
+
+2026-10-28：embedding 切换为百炼 text-embedding-v4（1024 维），本机真实调用的 scripts/smoke.py 通过；26 项测试通过。新增供应商限流/瞬时错误的有界重试。服务器部署尚未执行。

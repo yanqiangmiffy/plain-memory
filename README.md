@@ -34,7 +34,7 @@ Authorization: Bearer <config.local.yaml 中的 api_token>
 
 `config.example.yaml` 是 Doubao 冒烟模板：配置只填写服务根地址 `https://ark.cn-beijing.volces.com/api/plan/v3`，代码根据 `doubao_multimodal` 协议追加 `/embeddings/multimodal`。每个切片单独请求一次向量，不把多个切片合并成一条 embedding。所有调用在同一次 Add 请求内完成后才提交数据库。
 
-`config.text-embedding-v4.example.yaml` 是正式模型的配置骨架：只配置供应商的 `base_url`，代码为 `openai_compatible` 协议追加 `/embeddings`。协议和维度仍需按实际供应商确认。该协议支持批量 `input: [text, ...]` 和按返回 index 对齐。填写 dimensions 时会发送同名参数；供应商不支持该参数时保留 null，维度从成功写入结果确定。这里没有实现未确认的供应商专属协议。
+`config.text-embedding-v4.example.yaml` 是正式模型（百炼 DashScope text-embedding-v4，OpenAI 兼容协议，1024 维，单批最多 10 条）的配置，已用真实接口通过 `scripts/smoke.py`。生成：`python scripts/init_config.py --template config.text-embedding-v4.example.yaml --api-key-env DASHSCOPE_API_KEY`。供应商 429/5xx 会在服务截止时间内做有界退避重试。本服务不含任何 LLM 组件，因此满足 gpt-4o-mini 限制。该协议支持批量 `input: [text, ...]` 和按返回 index 对齐。填写 dimensions 时会发送同名参数；供应商不支持该参数时保留 null，维度从成功写入结果确定。这里没有实现未确认的供应商专属协议。
 
 切换模型、base_url、协议或切片配置时指定新数据库，例如 `data/text-embedding-v4.sqlite3`。服务拒绝把不同配置混入旧数据库，不会默默清空旧数据或重建。默认 512 token 切片、64 token 重叠，cl100k_base 计数；中文/emoji 字符边界会小幅调整。该计数器不等同于供应商的 tokenizer。
 
