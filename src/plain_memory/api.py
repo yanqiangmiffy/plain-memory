@@ -2,6 +2,7 @@
 
 import secrets
 import sqlite3
+import sys
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
@@ -15,9 +16,18 @@ from starlette.responses import JSONResponse
 from plain_memory import __version__
 from plain_memory.config import Settings
 from plain_memory.embedding import EmbeddingError, HTTPEmbedder, normalize_vectors
-from plain_memory.retrieval import retrieve
+from plain_memory.enrich import enrich, expand_query
+from plain_memory.llm import LLM, Reranker
+from plain_memory.retrieval import (
+    IndexCache,
+    _speaker_prefixed,
+    build_blocks,
+    format_time,
+    fuse,
+    render_block,
+)
 from plain_memory.store import RequestConflict, Store, StoreMismatch, payload_hash
-from plain_memory.text import chunks, lexical_terms
+from plain_memory.text import chunks, encoding, lexical_terms
 
 Identifier = Annotated[StrictStr, Field(min_length=1)]
 
@@ -78,6 +88,51 @@ class BodyLimit:
         await self.app(scope, buffered_receive, send)
 
 
+def _printable(value: str, limit: int) -> str:
+    """请求方可控的值写日志前去掉控制字符和空白，防止伪造日志行。"""
+    return "".join(c if c.isprintable() and c != " " else "?" for c in value[:limit])
+
+
+class RequestLog:
+    """每个请求一行写 stderr：只含 method、路径(无 query)、状态码、耗时、来源 IP。"""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        started, status = time.perf_counter(), None
+
+        async def capture(message):
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, capture)
+        except Exception:
+            status = status or 500
+            raise
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            forwarded = next((v for k, v in scope["headers"] if k == b"cf-connecting-ip"), None)
+            client = (
+                forwarded.decode("latin-1") if forwarded else (scope.get("client") or ("-",))[0]
+            )
+            print(
+                time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                _printable(scope["method"], 8),
+                _printable(scope["path"], 200),
+                status if status is not None else "-",
+                f"{elapsed_ms:.1f}ms",
+                _printable(client, 64),
+                file=sys.stderr,
+                flush=True,
+            )
+
+
 @contextmanager
 def capacity(semaphore):
     if not semaphore.acquire(blocking=False):
@@ -88,7 +143,71 @@ def capacity(semaphore):
         semaphore.release()
 
 
-def create_app(settings: Settings, *, embedder=None) -> FastAPI:
+def prepare_units(request, settings: Settings, llm, deadline: float) -> tuple:
+    """Build stored units and the texts to embed (message units, then fact units)."""
+    cfg = settings.retrieval
+    header = next(
+        (format_time(m.timestamp) for m in request.messages if m.timestamp is not None), None
+    )
+    units, embed_texts, previous = [], [], ""
+    for message_index, message in enumerate(request.messages):
+        line = _speaker_prefixed({"role": message.role, "content": message.content})
+        for chunk_index, text in enumerate(
+            chunks(message.content, settings.chunk_tokens, settings.overlap_tokens)
+        ):
+            units.append(
+                {
+                    "message_index": message_index,
+                    "chunk_index": chunk_index,
+                    "role": message.role,
+                    "timestamp": message.timestamp,
+                    "content": text,
+                    "kind": "msg",
+                    "note": None,
+                }
+            )
+            context = previous if cfg.context_embedding and chunk_index == 0 else ""
+            when = format_time(message.timestamp) or ""
+            embed_texts.append("\n".join(x for x in (when, context, text) if x))
+        previous = line[:240]
+    if cfg.add_notes and llm is not None and units:
+        lines = [
+            _speaker_prefixed({"role": m.role, "content": m.content[:2000]})
+            for m in request.messages
+        ]
+        notes, facts = enrich(
+            lines,
+            header or "unknown date",
+            llm,
+            time.monotonic() + (deadline - time.monotonic()) * 0.7,
+            settings.llm.group_tokens,
+        )
+        by_message = {u["message_index"]: u for u in units if u["chunk_index"] == 0}
+        for index, note in notes.items():
+            if index in by_message:
+                by_message[index]["note"] = note
+        if cfg.index_facts:
+            for number, (index, text) in enumerate(facts):
+                if index in by_message:
+                    anchor = by_message[index]
+                    units.append(
+                        {
+                            "message_index": index,
+                            "chunk_index": -(number + 1),
+                            "role": anchor["role"],
+                            "timestamp": anchor["timestamp"],
+                            "content": text,
+                            "kind": "fact",
+                            "note": None,
+                        }
+                    )
+                    embed_texts.append(text)
+    for unit, text in zip(units, embed_texts):
+        unit["terms"] = lexical_terms(f"{text} {unit['note'] or ''}")
+    return units, embed_texts
+
+
+def create_app(settings: Settings, *, embedder=None, llm=None, reranker=None) -> FastAPI:
     token = settings.api_token.get_secret_value()
     if len(token.encode()) < 32 or token == "GENERATE_LOCALLY":
         raise ValueError("Set a random api_token (at least 32 bytes) in the private local config.")
@@ -98,6 +217,11 @@ def create_app(settings: Settings, *, embedder=None) -> FastAPI:
     except Exception:
         encoder.close()
         raise
+    if llm is None and settings.llm is not None:
+        llm = LLM(settings.llm)
+    if reranker is None and settings.rerank is not None and settings.retrieval.rerank:
+        reranker = Reranker(settings.rerank)
+    cache = IndexCache()
     add_slots = threading.BoundedSemaphore(settings.add_concurrency)
     search_slots = threading.BoundedSemaphore(settings.search_concurrency)
 
@@ -107,6 +231,9 @@ def create_app(settings: Settings, *, embedder=None) -> FastAPI:
             yield
         finally:
             encoder.close()
+            for extra in (llm, reranker):
+                if extra is not None:
+                    extra.close()
 
     app = FastAPI(
         title="PlainMemory",
@@ -118,6 +245,8 @@ def create_app(settings: Settings, *, embedder=None) -> FastAPI:
     )
     app.state.store = store
     app.add_middleware(BodyLimit, maximum=settings.max_body_bytes)
+    if settings.request_log:
+        app.add_middleware(RequestLog)  # 最后添加=最外层，也能记录 BodyLimit 的 413
 
     def authorized(authorization: str | None = Header(default=None)):
         expected = f"Bearer {token}".encode()
@@ -174,25 +303,11 @@ def create_app(settings: Settings, *, embedder=None) -> FastAPI:
             deadline = time.monotonic() + settings.add_timeout_seconds
             if store.completed(payload, digest):
                 return response
-            prepared = []
-            for message_index, message in enumerate(request.messages):
-                for chunk_index, text in enumerate(
-                    chunks(message.content, settings.chunk_tokens, settings.overlap_tokens)
-                ):
-                    prepared.append(
-                        {
-                            "message_index": message_index,
-                            "chunk_index": chunk_index,
-                            "role": message.role,
-                            "timestamp": message.timestamp,
-                            "content": text,
-                            "terms": lexical_terms(text),
-                        }
-                    )
+            prepared, embed_texts = prepare_units(request, settings, llm, deadline)
             vectors = None
             if prepared:
                 vectors = normalize_vectors(
-                    encoder.embed([chunk["content"] for chunk in prepared], deadline),
+                    encoder.embed(embed_texts, deadline),
                     len(prepared),
                     settings.embedding.dimensions,
                 )
@@ -207,18 +322,54 @@ def create_app(settings: Settings, *, embedder=None) -> FastAPI:
             raise HTTPException(422, "query must contain non-whitespace text.")
         with capacity(search_slots):
             deadline = time.monotonic() + settings.search_timeout_seconds
-            rows = store.snapshot(request.user_id)
-            if not rows:
+            index = cache.get(store, request.user_id)
+            if index is None:
                 return {"data": []}
+            cfg = settings.retrieval
             query = request.query
             if request.options:
                 query += "\nOptions:\n" + "\n".join(request.options)
-            vector = normalize_vectors(
-                encoder.embed([query], deadline), 1, settings.embedding.dimensions
-            )[0]
-            result = retrieve(rows, query, vector, request.top_k)
+            queries = [(query, 1.0)]
+            if cfg.query_expansion and llm is not None:
+                extra = expand_query(request.query, request.options, llm, deadline)
+                queries += [(text, 0.7) for text in extra]
+            vectors = normalize_vectors(
+                encoder.embed([text for text, _ in queries], deadline),
+                len(queries),
+                settings.embedding.dimensions,
+            )
+            blocks = build_blocks(index, fuse(index, queries, vectors, cfg), cfg)
+            limit = min(request.top_k, cfg.max_blocks)
+            rendered = [
+                (score, render_block(index, key, lo, hi, cfg.show_notes, cfg.show_facts))
+                for score, key, lo, hi in blocks
+            ]
+            if cfg.rerank and reranker is not None and rendered:
+                head = rendered[: cfg.rerank_candidates]
+                values = reranker.scores(
+                    query, [item["content"][:6000] for _, item in head], deadline
+                )
+                if values is not None:
+                    top_rrf = max((score for score, _ in head), default=0.0) or 1.0
+                    top_rr = max(values) or 1.0
+                    mixed = [
+                        (
+                            cfg.rerank_weight * v / top_rr + (1 - cfg.rerank_weight) * sc / top_rrf,
+                            item,
+                        )
+                        for (sc, item), v in zip(head, values)
+                    ]
+                    mixed.sort(key=lambda pair: -pair[0])
+                    rendered = mixed + rendered[cfg.rerank_candidates :]
             if time.monotonic() >= deadline:
                 raise EmbeddingError("Search exceeded the service deadline.")
-            return {"data": result}
+            data, used = [], 0
+            for _, item in rendered[:limit]:
+                size = len(encoding().encode(item["content"], disallowed_special=()))
+                if data and used + size > cfg.context_tokens:
+                    break
+                data.append(item)
+                used += size
+            return {"data": data}
 
     return app

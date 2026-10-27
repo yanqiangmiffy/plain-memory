@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 
 from plain_memory.api import create_app
-from plain_memory.retrieval import interleave, retrieve
+from plain_memory.config import RetrievalConfig
+from plain_memory.retrieval import UserIndex, build_blocks, fuse, interleave, render_block
 from plain_memory.store import StoreMismatch
 from plain_memory.text import chunks, encoding, lexical_terms
 
@@ -37,20 +38,61 @@ def test_interleaving_keeps_first_occurrence_and_fills_from_remaining_route():
     assert interleave([], [], 100) == []
 
 
-def test_chinese_lexical_terms_and_common_term_small_corpus():
+def make_rows(texts, kind="msg", request="r1", note=None):
+    rows = []
+    for i, text in enumerate(texts):
+        rows.append(
+            {
+                "id": f"{request}-{kind}-{i}",
+                "user_id": "u",
+                "request_id": request,
+                "message_index": i,
+                "chunk_index": 0,
+                "role": "user",
+                "source_timestamp_ms": 1704067200000,
+                "created_at": "2024-01-01T00:00:00Z",
+                "terms_json": json.dumps(lexical_terms(text)),
+                "embedding": np.ones(4, dtype="<f4").tobytes(),
+                "kind": kind,
+                "note": note if i == 0 else None,
+                "content": text,
+            }
+        )
+    return rows
+
+
+def test_chinese_lexical_terms_and_stemmed_english():
     assert "北京" in lexical_terms("我住在北京")
-    rows = [
-        {
-            "id": "one",
-            "content": "北京 orchid",
-            "role": "user",
-            "source_timestamp_ms": None,
-            "created_at": "2026-01-01T00:00:00Z",
-            "terms_json": json.dumps(lexical_terms("北京 orchid")),
-            "embedding": np.ones(4, dtype="<f4").tobytes(),
-        }
-    ]
-    assert retrieve(rows, "北京 orchid", np.ones(4), 100)[0]["id"] == "one"
+    assert lexical_terms("The cats are running") == ["cat", "run"]
+
+
+def test_blocks_expand_merge_and_render_with_date_and_notes():
+    texts = [f"Alice: line {i}" for i in range(8)] + ["Bob: orchid garden"]
+    rows = make_rows(texts, note="yesterday = 31 December 2023")
+    index = UserIndex(rows)
+    config = RetrievalConfig(window_before=1, window_after=1, candidate_units=1)
+    query = np.ones(4, dtype=np.float32)
+    scores = fuse(index, [("orchid", 1.0)], np.array([query]), config)
+    blocks = build_blocks(index, scores, config)
+    assert blocks[0][1:] == ("r1", 7, 8)  # orchid hit expands to its neighbour only
+    item = render_block(index, "r1", 0, 1, True)
+    assert item["content"].startswith("[Conversation excerpt | Monday, 1 January 2024]")
+    assert "(time note: yesterday = 31 December 2023)" in item["content"]
+    assert item["id"].startswith("mem_") and item["created_at"] == "2024-01-01T00:00:00Z"
+
+
+def test_fact_hits_map_back_to_their_source_message():
+    rows = make_rows(["Alice: hi", "Bob: bye", "Carol: ok"])
+    fact = make_rows(["Alice adopted an orchid."], kind="fact")[0]
+    fact["message_index"] = 2
+    fact["embedding"] = (-np.ones(4, dtype="<f4")).tobytes()
+    index = UserIndex(rows + [fact])
+    config = RetrievalConfig(window_before=0, window_after=0, candidate_units=1)
+    scores = fuse(index, [("orchid", 1.0)], np.array([np.ones(4, dtype=np.float32)]), config)
+    (score, key, lo, hi), *_ = build_blocks(index, scores, config)
+    assert (key, lo, hi) == ("r1", 2, 2)
+    assert "Alice adopted an orchid." in render_block(index, key, lo, hi, True, True)["content"]
+    assert "Facts:" not in render_block(index, key, lo, hi, True, False)["content"]
 
 
 def test_model_switch_rejected_on_existing_database(settings, fake):

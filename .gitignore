@@ -29,3 +29,6 @@ datasets
 agent-memory-leaderboard
 docs
 
+
+eval/*.log
+eval/res_*.json

@@ -46,7 +46,7 @@ class Store:
                     chunk_index INTEGER NOT NULL, role TEXT NOT NULL,
                     source_timestamp_ms INTEGER, content TEXT NOT NULL,
                     terms_json TEXT NOT NULL, embedding BLOB NOT NULL,
-                    created_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'msg', note TEXT,
                     FOREIGN KEY (user_id, request_id)
                         REFERENCES add_requests(user_id, request_id) ON DELETE CASCADE
                 );
@@ -130,7 +130,9 @@ class Store:
                     )
                     created_at = source_date.isoformat().replace("+00:00", "Z")
                 conn.execute(
-                    "INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO chunks (id, user_id, session_id, request_id, message_index, "
+                    "chunk_index, role, source_timestamp_ms, content, terms_json, embedding, "
+                    "created_at, kind, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         chunk_id,
                         payload["user_id"],
@@ -144,8 +146,18 @@ class Store:
                         canonical(chunk["terms"]),
                         vectors[index].tobytes(),
                         created_at,
+                        chunk.get("kind", "msg"),
+                        chunk.get("note"),
                     ),
                 )
+
+    def fingerprint(self, user_id: str) -> tuple[int, int]:
+        """Cheap change detector for per-user index caches."""
+        with self.connection() as conn:
+            count, last = conn.execute(
+                "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM chunks WHERE user_id=?", (user_id,)
+            ).fetchone()
+        return count, last
 
     def snapshot(self, user_id: str) -> list[dict]:
         with self.connection() as conn:

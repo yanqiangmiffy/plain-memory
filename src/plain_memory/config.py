@@ -32,29 +32,88 @@ class EmbeddingConfig(BaseModel):
         return self
 
 
+class LLMConfig(BaseModel):
+    """gpt-4o-mini via any OpenAI-compatible chat endpoint (open-source track requirement)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str
+    model: str = "openai/gpt-4o-mini"
+    api_key: SecretStr
+    concurrency: int = Field(default=8, ge=1, le=64)
+    timeout_seconds: float = Field(default=60, gt=0)
+    group_tokens: int = Field(default=3000, ge=200)
+    proxy: str | None = None  # e.g. an HTTP(S) egress proxy when the endpoint is geo-blocked
+
+
+class RerankConfig(BaseModel):
+    """DashScope text-rerank (the leaderboard does not restrict rerankers)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str
+    model: str = "qwen3-rerank"
+    api_key: SecretStr
+    timeout_seconds: float = Field(default=30, gt=0)
+
+
+class RetrievalConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    window_before: int = Field(default=2, ge=0)
+    window_after: int = Field(default=2, ge=0)
+    max_block_units: int = Field(default=12, ge=1)
+    candidate_units: int = Field(default=60, ge=1)
+    max_blocks: int = Field(default=100, ge=1, le=100)
+    context_tokens: int = Field(default=60000, ge=1000)  # stop adding excerpts past this size
+    rrf_k: int = Field(default=60, ge=1)
+    context_embedding: bool = True  # embed each message together with its predecessor
+    add_notes: bool = False  # LLM: time notes + atomic facts at Add
+    index_facts: bool = True
+    show_notes: bool = True  # inline resolved-time notes in returned excerpts
+    show_facts: bool = False  # append extracted facts to returned excerpts
+    query_expansion: bool = False  # LLM: sub-queries at Search
+    rerank: bool = False
+    rerank_candidates: int = Field(default=50, ge=1, le=200)
+    rerank_weight: float = Field(default=0.7, ge=0, le=1)
+
+
 class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     api_token: SecretStr
     database: Path
     embedding: EmbeddingConfig
+    llm: LLMConfig | None = None
+    rerank: RerankConfig | None = None
+    retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
     chunk_tokens: int = Field(default=512, ge=4)
     overlap_tokens: int = Field(default=64, ge=0)
     max_body_bytes: int = Field(default=16 * 1024 * 1024, ge=1)
     add_concurrency: int = Field(default=16, ge=16, le=64)
     search_concurrency: int = Field(default=16, ge=16, le=256)
-    add_timeout_seconds: float = Field(default=120, gt=0)
-    search_timeout_seconds: float = Field(default=30, gt=0)
+    add_timeout_seconds: float = Field(default=600, gt=0)
+    search_timeout_seconds: float = Field(default=120, gt=0)
+    request_log: bool = False  # one stderr line per request: no query, body or credentials
 
     @model_validator(mode="after")
     def check_overlap(self):
+        r = self.retrieval
+        if (r.add_notes or r.query_expansion) and self.llm is None:
+            raise ValueError("retrieval features add_notes/query_expansion require an llm section")
+        if r.rerank and self.rerank is None:
+            raise ValueError("retrieval.rerank requires a rerank section")
         if self.overlap_tokens >= self.chunk_tokens:
             raise ValueError("overlap_tokens must be smaller than chunk_tokens")
         return self
 
     def store_identity(self) -> dict:
         return {
-            "schema": 2,
+            "schema": 3,
+            "context_embedding": self.retrieval.context_embedding,
+            "add_notes": self.retrieval.add_notes,
+            "index_facts": self.retrieval.index_facts,
+            "llm_model": self.llm.model if self.llm and self.retrieval.add_notes else None,
             "model": self.embedding.model,
             "base_url": self.embedding.base_url,
             "protocol": self.embedding.protocol,
@@ -62,7 +121,7 @@ class Settings(BaseModel):
             "tokenizer": "cl100k_base",
             "chunk_tokens": self.chunk_tokens,
             "overlap_tokens": self.overlap_tokens,
-            "lexical_version": "english-words-han-unigrams-bigrams-v1",
+            "lexical_version": "english-stem-stopword-han-unigrams-bigrams-v2",
         }
 
 

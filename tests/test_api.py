@@ -76,11 +76,19 @@ def test_options_top_k_and_message_order(settings, fake, headers):
             {"role": "user", "content": "beta orchid", "timestamp": 1000},
         ]
         assert client.post("/add", headers=headers, json=payload).status_code == 200
-        assert fake.calls[0] == ["alpha orchid", "beta orchid"]
+        day = "Thursday, 1 January 1970"
+        assert fake.calls[0] == [
+            f"{day}\nalpha orchid",
+            f"{day}\nassistant: alpha orchid\nbeta orchid",
+        ]
         response = search(client, headers, top_k=1, options=["A. orchid", "B. cactus"])
         assert response.status_code == 200 and len(response.json()["data"]) == 1
         assert fake.calls[-1] == ["orchid\nOptions:\nA. orchid\nB. cactus"]
-        assert len(search(client, headers, top_k=100).json()["data"]) == 2
+        merged = search(client, headers, top_k=100).json()["data"]
+        assert len(merged) == 1  # neighbouring messages come back as one excerpt, in order
+        assert merged[0]["content"].index("alpha orchid") < merged[0]["content"].index(
+            "beta orchid"
+        )
         rows = app.state.store.snapshot(payload["user_id"])
         assert [row["source_timestamp_ms"] for row in rows] == [2000, 1000]
 
@@ -115,6 +123,35 @@ def test_body_limit_including_streamed_body(settings, fake, headers):
             content=iter([b'{"messages": "', b"x" * 100, b"x" * 100, b'"}']),
         )
         assert response.status_code == 413 and not fake.calls
+
+
+def test_request_log_is_off_by_default(settings, fake, capsys):
+    with TestClient(create_app(settings, embedder=fake)) as client:
+        assert client.get("/health").status_code == 200
+    assert capsys.readouterr().err == ""
+
+
+def test_request_log_records_only_safe_fields(settings, fake, headers, capsys):
+    settings.request_log = True
+    settings.max_body_bytes = 4096
+    with TestClient(create_app(settings, embedder=fake)) as client:
+        client.get("/health?secret_query=DO_NOT_LOG", headers={"CF-Connecting-IP": "203.0.113.7"})
+        payload = memory()
+        payload["messages"][0]["content"] = "DO_NOT_LOG_BODY"
+        client.post("/add", headers=headers, json=payload)
+        client.post("/add", json=payload)
+        client.post("/add", headers=headers, content=b"x" * 5000)
+        client.get("/a%0Ab%20c")
+    err = capsys.readouterr().err
+    lines = err.splitlines()
+    assert len(lines) == 5
+    assert " GET /health 200 " in lines[0] and lines[0].endswith(" 203.0.113.7")
+    assert " POST /add 200 " in lines[1] and " POST /add 401 " in lines[2]
+    assert " POST /add 413 " in lines[3]
+    assert " GET /a?b?c 404 " in lines[4]
+    for secret in ("DO_NOT_LOG", headers["Authorization"], headers["Authorization"][7:]):
+        assert secret not in err
+    assert all(line.split()[4].endswith("ms") for line in lines)
 
 
 def test_whitespace_messages_remain_durable_without_empty_search_hits(settings, fake, headers):

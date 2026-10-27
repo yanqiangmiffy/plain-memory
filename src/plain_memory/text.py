@@ -3,6 +3,7 @@
 import re
 from functools import lru_cache
 
+import Stemmer
 import tiktoken
 
 
@@ -45,9 +46,20 @@ def chunks(text: str, size: int, overlap: int) -> list[str]:
     return result
 
 
+_STEMMER = Stemmer.Stemmer("english")
+_STOPWORDS = frozenset(
+    "a an the and or but if of to in on at by for with from as is are was were be been being am "
+    "do does did have has had it its this that these those i me my we our you your he him his she "
+    "her they them their what which who whom when where why how not no so than then too very can "
+    "will just about into over under again there here also".split()
+)
+
+
 def lexical_terms(text: str) -> list[str]:
-    terms = re.findall(r"[a-z0-9]+(?:['_-][a-z0-9]+)*", text.lower())
-    for run in re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]+", text):
+    """English: lowercase, stopword-free, Porter-style stems. CJK: unigrams + bigrams."""
+    words = re.findall(r"[a-z0-9]+(?:['_-][a-z0-9]+)*", text.lower())
+    terms = _STEMMER.stemWords([w for w in words if w not in _STOPWORDS])
+    for run in re.findall(r"[㐀-䶿一-鿿]+", text):
         terms.extend(run)
         terms.extend(run[i : i + 2] for i in range(len(run) - 1))
     return terms

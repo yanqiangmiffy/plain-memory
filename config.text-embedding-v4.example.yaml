@@ -2,14 +2,14 @@
 # Use a NEW database when switching from any other embedding model.
 # Copy to config.local.yaml (or run scripts/init_config.py --preset text-embedding-v4).
 api_token: "GENERATE_LOCALLY"
-database: "data/text-embedding-v4.sqlite3"
+database: "data/v2.sqlite3"
 chunk_tokens: 512
 overlap_tokens: 64
 max_body_bytes: 16777216
 add_concurrency: 16
 search_concurrency: 16
-add_timeout_seconds: 120
-search_timeout_seconds: 30
+add_timeout_seconds: 600
+search_timeout_seconds: 120
 embedding:
   protocol: "openai_compatible"
   base_url: "https://llm-et2ipodeqk0ea8be.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
@@ -17,3 +17,21 @@ embedding:
   api_key: "REPLACE_WITH_YOUR_PROVIDER_KEY"
   dimensions: 1024  # text-embedding-v4 default; explicit so the DB identity is stable.
   batch_size: 10    # DashScope text-embedding-v4 accepts at most 10 inputs per request.
+# gpt-4o-mini (the only LLM component; official open-source-track requirement).
+llm:
+  base_url: "https://openrouter.ai/api/v1"
+  model: "openai/gpt-4o-mini"
+  api_key: "REPLACE_WITH_OPENROUTER_KEY"
+  concurrency: 16
+# Reranker is unrestricted by the leaderboard rules.
+rerank:
+  base_url: "https://llm-et2ipodeqk0ea8be.cn-beijing.maas.aliyuncs.com/api/v1"
+  model: "qwen3-rerank"
+  api_key: "REPLACE_WITH_YOUR_PROVIDER_KEY"
+retrieval:
+  add_notes: true   # gpt-4o-mini: resolved time notes + atomic fact index at Add
+  index_facts: true
+  show_notes: true
+  show_facts: false
+  rerank: true
+  query_expansion: false
