@@ -35,3 +35,4 @@ retrieval:
   show_facts: false
   rerank: true
   query_expansion: false
+request_log: true

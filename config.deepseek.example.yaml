@@ -1,0 +1,39 @@
+# Same as config.text-embedding-v4.example.yaml, but the LLM component is DeepSeek
+# (OpenAI-compatible, reachable from CN servers without a relay) instead of gpt-4o-mini via OpenRouter.
+# Use a NEW database if add_notes is on: the LLM model name is part of the database identity.
+# Copy to config.local.yaml (or run scripts/init_config.py --preset text-embedding-v4, then replace the llm section).
+api_token: "GENERATE_LOCALLY"
+database: "data/v2.sqlite3"
+chunk_tokens: 512
+overlap_tokens: 64
+max_body_bytes: 16777216
+add_concurrency: 16
+search_concurrency: 16
+add_timeout_seconds: 600
+search_timeout_seconds: 120
+embedding:
+  protocol: "openai_compatible"
+  base_url: "https://llm-et2ipodeqk0ea8be.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+  model: "text-embedding-v4"
+  api_key: "REPLACE_WITH_YOUR_PROVIDER_KEY"
+  dimensions: 1024  # text-embedding-v4 default; explicit so the DB identity is stable.
+  batch_size: 10    # DashScope text-embedding-v4 accepts at most 10 inputs per request.
+# DeepSeek chat model (the only LLM component).
+llm:
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-flash"
+  api_key: "REPLACE_WITH_DEEPSEEK_KEY"
+  concurrency: 16
+# Reranker is unrestricted by the leaderboard rules.
+rerank:
+  base_url: "https://llm-et2ipodeqk0ea8be.cn-beijing.maas.aliyuncs.com/api/v1"
+  model: "qwen3-rerank"
+  api_key: "REPLACE_WITH_YOUR_PROVIDER_KEY"
+retrieval:
+  add_notes: true   # DeepSeek: resolved time notes + atomic fact index at Add
+  index_facts: true
+  show_notes: true
+  show_facts: false
+  rerank: true
+  query_expansion: false
+request_log: true

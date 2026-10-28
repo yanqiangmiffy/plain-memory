@@ -2,6 +2,7 @@
 config*.yaml
 !config.example.yaml
 !config.text-embedding-v4.example.yaml
+!config.deepseek.example.yaml
 *.local.yaml
 *.local.yml
 .env
