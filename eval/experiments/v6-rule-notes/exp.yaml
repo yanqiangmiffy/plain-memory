@@ -1,0 +1,3 @@
+description: v4 + deterministic relative-time notes at Add ("yesterday = 7 May 2023"), no LLM
+db: rule-notes
+retrieval: {rerank: true, rule_notes: true}

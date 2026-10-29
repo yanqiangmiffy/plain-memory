@@ -33,3 +33,11 @@ docs
 
 eval/*.log
 eval/res_*.json
+eval/llm_cache.sqlite3*
+eval/configs/
+
+eval/_archive/
+eval/.cache/
+eval/.run/
+eval/results/*/*/*.log
+reference

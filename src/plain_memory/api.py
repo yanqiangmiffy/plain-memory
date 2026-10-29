@@ -1,5 +1,6 @@
 """AML 外部契约；成功仅在完整写入后返回，错误不回显私密输入。"""
 
+import functools
 import secrets
 import sqlite3
 import sys
@@ -13,21 +14,16 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 from starlette.responses import JSONResponse
 
-from plain_memory import __version__
+from plain_memory import __version__, feedback, timeparse
 from plain_memory.config import Settings
 from plain_memory.embedding import EmbeddingError, HTTPEmbedder, normalize_vectors
-from plain_memory.enrich import enrich, expand_query
+from plain_memory.enrich import enrich
+from plain_memory.journal import Journal, status_of
 from plain_memory.llm import LLM, Reranker
-from plain_memory.retrieval import (
-    IndexCache,
-    _speaker_prefixed,
-    build_blocks,
-    format_time,
-    fuse,
-    render_block,
-)
+from plain_memory.retrieval import IndexCache, _speaker_prefixed, format_time
+from plain_memory.searching import run_search
 from plain_memory.store import RequestConflict, Store, StoreMismatch, payload_hash
-from plain_memory.text import chunks, encoding, lexical_terms
+from plain_memory.text import chunks, lexical_terms
 
 Identifier = Annotated[StrictStr, Field(min_length=1)]
 
@@ -152,6 +148,29 @@ def prepare_units(request, settings: Settings, llm, deadline: float) -> tuple:
     units, embed_texts, previous = [], [], ""
     for message_index, message in enumerate(request.messages):
         line = _speaker_prefixed({"role": message.role, "content": message.content})
+        attempt = feedback.parse(message.content, message.role) if cfg.feedback_units else None
+        if attempt is not None:  # a graded earlier answer, indexed by its question
+            units.append(
+                {
+                    "message_index": message_index,
+                    "chunk_index": 0,
+                    "role": message.role,
+                    "timestamp": message.timestamp,
+                    "content": attempt.render(),
+                    "kind": "fb",
+                    "note": attempt.outcome,
+                    "terms": lexical_terms(f"{attempt.question} {attempt.answer}"),
+                }
+            )
+            embed_texts.append(f"Question: {attempt.question}")
+            previous = line[:240]
+            continue
+        rule_note = None
+        if cfg.rule_notes and message.timestamp is not None:
+            found = timeparse.relative_notes(
+                message.content, timeparse.moment_of(message.timestamp)
+            )
+            rule_note = "; ".join(found) if found else None
         for chunk_index, text in enumerate(
             chunks(message.content, settings.chunk_tokens, settings.overlap_tokens)
         ):
@@ -163,12 +182,13 @@ def prepare_units(request, settings: Settings, llm, deadline: float) -> tuple:
                     "timestamp": message.timestamp,
                     "content": text,
                     "kind": "msg",
-                    "note": None,
+                    "note": rule_note if chunk_index == 0 else None,
                 }
             )
             context = previous if cfg.context_embedding and chunk_index == 0 else ""
             when = format_time(message.timestamp) or ""
-            embed_texts.append("\n".join(x for x in (when, context, text) if x))
+            hint = f"({rule_note})" if rule_note and chunk_index == 0 else ""
+            embed_texts.append("\n".join(x for x in (when, context, text, hint) if x))
         previous = line[:240]
     if cfg.add_notes and llm is not None and units:
         lines = [
@@ -184,7 +204,7 @@ def prepare_units(request, settings: Settings, llm, deadline: float) -> tuple:
         )
         by_message = {u["message_index"]: u for u in units if u["chunk_index"] == 0}
         for index, note in notes.items():
-            if index in by_message:
+            if index in by_message and not by_message[index]["note"]:
                 by_message[index]["note"] = note
         if cfg.index_facts:
             for number, (index, text) in enumerate(facts):
@@ -222,6 +242,11 @@ def create_app(settings: Settings, *, embedder=None, llm=None, reranker=None) ->
     if reranker is None and settings.rerank is not None and settings.retrieval.rerank:
         reranker = Reranker(settings.rerank)
     cache = IndexCache()
+    journal = (
+        Journal(settings.request_journal, settings.journal_max_bytes)
+        if settings.request_journal is not None
+        else None
+    )
     add_slots = threading.BoundedSemaphore(settings.add_concurrency)
     search_slots = threading.BoundedSemaphore(settings.search_concurrency)
 
@@ -286,7 +311,32 @@ def create_app(settings: Settings, *, embedder=None, llm=None, reranker=None) ->
     for path in ("/", "/health", "/add", "/search"):
         app.add_api_route(path, health, methods=["GET"])
 
+    def journaled(endpoint: str):
+        """Record every call (success or failure) of a handler in the optional journal."""
+
+        def wrap(handler):
+            if journal is None:
+                return handler
+
+            @functools.wraps(handler)
+            def inner(request):
+                started = time.perf_counter()
+                body = request.model_dump()
+                try:
+                    result = handler(request)
+                except Exception as exc:
+                    detail = getattr(exc, "detail", None) or str(exc)
+                    journal.write(endpoint, started, status_of(exc), body, None, detail)
+                    raise
+                journal.write(endpoint, started, 200, body, result)
+                return result
+
+            return inner
+
+        return wrap
+
     @app.post("/add", dependencies=[Depends(authorized)])
+    @journaled("add")
     def add(request: AddRequest):
         payload = request.model_dump()
         digest = payload_hash(payload)
@@ -317,6 +367,7 @@ def create_app(settings: Settings, *, embedder=None, llm=None, reranker=None) ->
         return response
 
     @app.post("/search", dependencies=[Depends(authorized)])
+    @journaled("search")
     def search(request: SearchRequest):
         if not request.query.strip():
             raise HTTPException(422, "query must contain non-whitespace text.")
@@ -325,51 +376,7 @@ def create_app(settings: Settings, *, embedder=None, llm=None, reranker=None) ->
             index = cache.get(store, request.user_id)
             if index is None:
                 return {"data": []}
-            cfg = settings.retrieval
-            query = request.query
-            if request.options:
-                query += "\nOptions:\n" + "\n".join(request.options)
-            queries = [(query, 1.0)]
-            if cfg.query_expansion and llm is not None:
-                extra = expand_query(request.query, request.options, llm, deadline)
-                queries += [(text, 0.7) for text in extra]
-            vectors = normalize_vectors(
-                encoder.embed([text for text, _ in queries], deadline),
-                len(queries),
-                settings.embedding.dimensions,
-            )
-            blocks = build_blocks(index, fuse(index, queries, vectors, cfg), cfg)
-            limit = min(request.top_k, cfg.max_blocks)
-            rendered = [
-                (score, render_block(index, key, lo, hi, cfg.show_notes, cfg.show_facts))
-                for score, key, lo, hi in blocks
-            ]
-            if cfg.rerank and reranker is not None and rendered:
-                head = rendered[: cfg.rerank_candidates]
-                values = reranker.scores(
-                    query, [item["content"][:6000] for _, item in head], deadline
-                )
-                if values is not None:
-                    top_rrf = max((score for score, _ in head), default=0.0) or 1.0
-                    top_rr = max(values) or 1.0
-                    mixed = [
-                        (
-                            cfg.rerank_weight * v / top_rr + (1 - cfg.rerank_weight) * sc / top_rrf,
-                            item,
-                        )
-                        for (sc, item), v in zip(head, values)
-                    ]
-                    mixed.sort(key=lambda pair: -pair[0])
-                    rendered = mixed + rendered[cfg.rerank_candidates :]
-            if time.monotonic() >= deadline:
-                raise EmbeddingError("Search exceeded the service deadline.")
-            data, used = [], 0
-            for _, item in rendered[:limit]:
-                size = len(encoding().encode(item["content"], disallowed_special=()))
-                if data and used + size > cfg.context_tokens:
-                    break
-                data.append(item)
-                used += size
+            data = run_search(index, request, settings, encoder, llm, reranker, deadline)
             return {"data": data}
 
     return app

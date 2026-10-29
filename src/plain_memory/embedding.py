@@ -6,6 +6,7 @@ import httpx
 import numpy as np
 
 from plain_memory.config import EmbeddingConfig
+from plain_memory.embed_cache import EmbeddingCache
 
 RETRY_ATTEMPTS = 5
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
@@ -42,6 +43,10 @@ class HTTPEmbedder:
             raise ValueError("Embedding base_url must use HTTPS (or loopback HTTP for tests).")
         path = "/embeddings/multimodal" if config.protocol == "doubao_multimodal" else "/embeddings"
         self.url = config.base_url + path
+        self.cache = None
+        if config.cache_path is not None:
+            namespace = f"{config.protocol}|{config.model}|{config.dimensions}"
+            self.cache = EmbeddingCache(config.cache_path, namespace)
         self.client = httpx.Client(
             headers={"Authorization": f"Bearer {key}"},
             transport=transport,
@@ -77,6 +82,19 @@ class HTTPEmbedder:
         raise AssertionError("unreachable")
 
     def embed(self, texts: list[str], deadline: float) -> np.ndarray:
+        if self.cache is None or not texts:
+            return self._embed(texts, deadline)
+        keys = [self.cache.key(text) for text in texts]
+        found = self.cache.get_many(list(dict.fromkeys(keys)))
+        pending = {key: text for key, text in zip(keys, texts) if key not in found}
+        if pending:
+            fresh = self._embed(list(pending.values()), deadline)
+            added = dict(zip(pending.keys(), fresh))
+            self.cache.put_many(added)
+            found.update(added)
+        return normalize_vectors([found[key] for key in keys], len(texts), self.config.dimensions)
+
+    def _embed(self, texts: list[str], deadline: float) -> np.ndarray:
         vectors = []
         batch_size = 1 if self.config.protocol == "doubao_multimodal" else self.config.batch_size
         for start in range(0, len(texts), batch_size):

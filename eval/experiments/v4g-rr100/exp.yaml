@@ -1,0 +1,3 @@
+description: v4 ordering purely by rerank score (weight 1.0 instead of 0.7)
+db: ctx-on
+retrieval: {rerank: true, rerank_weight: 1.0}

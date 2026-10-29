@@ -17,6 +17,7 @@ class EmbeddingConfig(BaseModel):
     api_key: SecretStr
     dimensions: int | None = Field(default=None, gt=0)
     batch_size: int = Field(default=32, ge=1)
+    cache_path: Path | None = None  # optional vector cache for offline experiments
 
     @model_validator(mode="after")
     def check_base_url(self):
@@ -43,6 +44,9 @@ class LLMConfig(BaseModel):
     concurrency: int = Field(default=8, ge=1, le=64)
     timeout_seconds: float = Field(default=60, gt=0)
     group_tokens: int = Field(default=3000, ge=200)
+    extra_body: dict = Field(
+        default_factory=dict
+    )  # merged into the chat payload (e.g. vLLM template kwargs)
     proxy: str | None = None  # e.g. an HTTP(S) egress proxy when the endpoint is geo-blocked
 
 
@@ -55,6 +59,7 @@ class RerankConfig(BaseModel):
     model: str = "qwen3-rerank"
     api_key: SecretStr
     timeout_seconds: float = Field(default=30, gt=0)
+    cache_path: Path | None = None  # optional score cache for offline experiments
 
 
 class RetrievalConfig(BaseModel):
@@ -72,9 +77,26 @@ class RetrievalConfig(BaseModel):
     index_facts: bool = True
     show_notes: bool = True  # inline resolved-time notes in returned excerpts
     show_facts: bool = False  # append extracted facts to returned excerpts
+    rule_notes: bool = False  # Add: deterministic relative-time notes ("yesterday = 7 May 2023")
+    date_boost: float = Field(default=0.0, ge=0)  # Search: nudge messages written on a queried date
+    feedback_units: bool = True  # Add: parse streaming QA-feedback envelopes into graded attempts
+    feedback_pass_boost: float = Field(default=1.2, gt=0)
+    feedback_fail_penalty: float = Field(default=0.35, gt=0)
+    current_state_order: bool = False  # current-state questions: newest excerpts first
+    profile_digest: bool = False  # recommendation questions: prepend the user's own statements
+    profile_items: int = Field(default=5, ge=1, le=12)
+    overview_outline: bool = False  # overview questions: per-session outline + session round-robin
+    redact_secrets: bool = True  # mask credentials in returned text unless the question asks
+    option_views: bool = False  # multiple choice: also retrieve with each option as a hypothesis
     query_expansion: bool = False  # LLM: sub-queries at Search
     rerank: bool = False
+    order: Literal["relevance", "chronological"] = "relevance"  # order of returned excerpts
+    min_relative_score: float = Field(
+        default=0.0, ge=0, le=1
+    )  # cut excerpts scoring below this x top
+    min_blocks: int = Field(default=5, ge=1)
     rerank_candidates: int = Field(default=50, ge=1, le=200)
+    rerank_chars: int = Field(default=6000, ge=500)  # text sent per excerpt (cost knob)
     rerank_weight: float = Field(default=0.7, ge=0, le=1)
 
 
@@ -94,6 +116,8 @@ class Settings(BaseModel):
     search_concurrency: int = Field(default=16, ge=16, le=256)
     add_timeout_seconds: float = Field(default=600, gt=0)
     search_timeout_seconds: float = Field(default=120, gt=0)
+    request_journal: Path | None = None  # JSON-lines file with full Add/Search requests+responses
+    journal_max_bytes: int = Field(default=4 * 1024**3, ge=1024)
     request_log: bool = False  # one stderr line per request: no query, body or credentials
 
     @model_validator(mode="after")
@@ -112,6 +136,7 @@ class Settings(BaseModel):
             "schema": 3,
             "context_embedding": self.retrieval.context_embedding,
             "add_notes": self.retrieval.add_notes,
+            **({"rule_notes": True} if self.retrieval.rule_notes else {}),
             "index_facts": self.retrieval.index_facts,
             "llm_model": self.llm.model if self.llm and self.retrieval.add_notes else None,
             "model": self.embedding.model,
@@ -133,4 +158,12 @@ def load_settings(path: Path) -> Settings:
         # Pydantic/YAML 的默认错误包含输入值；不得输出配置中的密钥。
         raise ValueError("Cannot load config; check file, field names and types.") from None
     settings.database = (path.resolve().parent / settings.database).resolve()
+    if settings.request_journal is not None:
+        settings.request_journal = (path.resolve().parent / settings.request_journal).resolve()
+    if settings.rerank is not None and settings.rerank.cache_path is not None:
+        settings.rerank.cache_path = (path.resolve().parent / settings.rerank.cache_path).resolve()
+    if settings.embedding.cache_path is not None:
+        settings.embedding.cache_path = (
+            path.resolve().parent / settings.embedding.cache_path
+        ).resolve()
     return settings

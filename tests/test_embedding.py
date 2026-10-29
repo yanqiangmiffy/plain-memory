@@ -1,3 +1,4 @@
+import json
 import time
 
 import httpx
@@ -114,5 +115,29 @@ def test_provider_errors_do_not_expose_private_response():
             embedder.embed(["private memory"], time.monotonic() + 10)
         assert "PRIVATE_KEY_OR_CONTENT" not in str(caught.value)
         assert caught.value.status == 503
+    finally:
+        embedder.close()
+
+
+def test_embedding_cache_reuses_vectors_and_dedupes(tmp_path):
+    calls = []
+
+    def handle(request):
+        payload = json.loads(request.content)
+        calls.append(list(payload["input"]))
+        data = [
+            {"index": i, "embedding": [float(len(t)), 1.0]} for i, t in enumerate(payload["input"])
+        ]
+        return httpx.Response(200, json={"data": data})
+
+    cfg = config()
+    cfg.cache_path = tmp_path / "vectors.sqlite3"
+    embedder = HTTPEmbedder(cfg, transport=httpx.MockTransport(handle))
+    try:
+        first = embedder.embed(["aa", "bbb", "aa"], time.monotonic() + 10)
+        assert calls == [["aa", "bbb"]] and first.shape == (3, 2)
+        again = embedder.embed(["bbb", "aa", "cccc"], time.monotonic() + 10)
+        assert calls[1:] == [["cccc"]]
+        assert np.allclose(again[0], first[1]) and np.allclose(again[1], first[0])
     finally:
         embedder.close()

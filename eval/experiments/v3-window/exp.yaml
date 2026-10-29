@@ -1,0 +1,3 @@
+description: v2 + hits expanded to +-2 neighbouring messages merged into excerpts
+db: ctx-on
+retrieval: {rerank: false}

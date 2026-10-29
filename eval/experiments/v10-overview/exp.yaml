@@ -1,0 +1,3 @@
+description: v6 + overview questions get a per-session outline and one excerpt per session first
+db: rule-notes
+retrieval: {rerank: true, rule_notes: true, overview_outline: true}

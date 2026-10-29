@@ -12,6 +12,7 @@ import time
 import httpx
 
 from plain_memory.config import LLMConfig, RerankConfig
+from plain_memory.embed_cache import ScoreCache
 
 RETRYABLE = {408, 425, 429, 500, 502, 503, 504}
 
@@ -52,6 +53,7 @@ class LLM:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
+            **self.config.extra_body,
         }
         with self.slots:
             for attempt in range(4):
@@ -77,6 +79,9 @@ class LLM:
 class Reranker:
     def __init__(self, config: RerankConfig, *, transport=None):
         self.config = config
+        self.cache = (
+            ScoreCache(config.cache_path, config.model) if config.cache_path is not None else None
+        )
         self.client = httpx.Client(
             headers={"Authorization": "Bearer " + config.api_key.get_secret_value()},
             transport=transport,
@@ -88,6 +93,21 @@ class Reranker:
 
     def scores(self, query: str, documents: list[str], deadline: float) -> list[float] | None:
         """Relevance score per document (same order), or None on any failure."""
+        if self.cache is None or not documents:
+            return self._request(query, documents, deadline)
+        keys = [self.cache.key(query, d) for d in documents]
+        found = self.cache.get_many(list(dict.fromkeys(keys)))
+        missing = [i for i, k in enumerate(keys) if k not in found]
+        if missing:
+            fresh = self._request(query, [documents[i] for i in missing], deadline)
+            if fresh is None:
+                return None
+            added = {keys[i]: v for i, v in zip(missing, fresh)}
+            self.cache.put_many(added)
+            found.update(added)
+        return [found[k] for k in keys]
+
+    def _request(self, query: str, documents: list[str], deadline: float) -> list[float] | None:
         payload = {
             "model": self.config.model,
             "input": {"query": query, "documents": documents},

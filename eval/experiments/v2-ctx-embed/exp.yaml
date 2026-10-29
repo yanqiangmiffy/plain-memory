@@ -1,0 +1,3 @@
+description: v1 + each message embedded together with its date and the previous message
+db: ctx-on
+retrieval: {window_before: 0, window_after: 0, rerank: false}

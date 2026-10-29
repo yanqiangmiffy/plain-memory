@@ -9,9 +9,12 @@ from datetime import datetime, timedelta, timezone
 import bm25s
 import numpy as np
 
+from plain_memory import intent, timeparse
 from plain_memory.config import RetrievalConfig
 from plain_memory.embedding import EmbeddingError
 from plain_memory.text import lexical_terms
+
+FB_KEY = "\x00feedback"  # pseudo group key of single graded-attempt excerpts
 
 
 def interleave(vector_ids: list[str], bm25_ids: list[str], top_k: int) -> list[str]:
@@ -56,6 +59,13 @@ class UserIndex:
         except (ValueError, TypeError):
             raise EmbeddingError("Stored vectors are invalid.") from None
         self.rows = rows
+        self.days = [
+            timeparse.unit_day(row["source_timestamp_ms"]).toordinal()
+            if row["source_timestamp_ms"] is not None and row["kind"] == "msg"
+            else None
+            for row in rows
+        ]
+        self.feedback = {i: row["note"] for i, row in enumerate(rows) if row["kind"] == "fb"}
         terms = [json.loads(row["terms_json"]) for row in rows]
         self.searchable = [i for i, t in enumerate(terms) if t]
         self.bm25 = None
@@ -86,6 +96,14 @@ class UserIndex:
                 if target is not None:
                     self.anchor[i] = target
                     self.facts[target].append(row["content"])
+
+    def day_units(self, constraints) -> list[int]:
+        spans = [(a.toordinal(), b.toordinal()) for a, b in constraints]
+        return [
+            i
+            for i, day in enumerate(self.days)
+            if day is not None and any(a <= day <= b for a, b in spans)
+        ]
 
     def dense(self, vector: np.ndarray, limit: int) -> list[int]:
         if self.matrix.shape[1] != len(vector):
@@ -127,22 +145,42 @@ class IndexCache:
 
 
 def fuse(
-    index: UserIndex, queries: list[tuple[str, float]], vectors: np.ndarray, config: RetrievalConfig
+    index: UserIndex,
+    queries: list[tuple[str, float]],
+    vectors: np.ndarray,
+    config: RetrievalConfig,
+    original_query: str = "",
 ) -> dict[int, float]:
-    """Weighted RRF over dense and lexical rankings of every query variant."""
+    """Weighted RRF over dense and lexical rankings of every query view, plus two nudges:
+    messages written on a date the question names, and graded streaming attempts."""
     scores: dict[int, float] = defaultdict(float)
     limit = max(config.candidate_units * 3, 100)
     for (text, weight), vector in zip(queries, vectors):
         for ranking in (index.dense(vector, limit), index.lexical(text, limit)):
             for rank, unit in enumerate(ranking):
                 scores[unit] += weight / (config.rrf_k + rank + 1)
+    if config.date_boost > 0:
+        constraints = timeparse.query_dates(original_query)
+        if constraints:
+            for unit in index.day_units(constraints):
+                scores[unit] += config.date_boost
+    for unit, outcome in index.feedback.items():
+        if unit in scores:
+            if outcome == "passed":
+                scores[unit] *= config.feedback_pass_boost
+            elif outcome == "failed":
+                scores[unit] *= config.feedback_fail_penalty
     return scores
 
 
 def build_blocks(index: UserIndex, unit_scores: dict[int, float], config: RetrievalConfig):
     """Expand top units to neighbouring messages and merge overlaps -> [(score, key, lo, hi)]."""
     best: dict[int, float] = {}
+    attempts = []
     for unit, score in sorted(unit_scores.items(), key=lambda kv: -kv[1])[: config.candidate_units]:
+        if unit in index.feedback:
+            attempts.append((score, FB_KEY, unit, unit))
+            continue
         anchor = index.anchor.get(unit, unit)
         if anchor in index.position and score > best.get(anchor, 0.0):
             best[anchor] = score
@@ -170,6 +208,7 @@ def build_blocks(index: UserIndex, unit_scores: dict[int, float], config: Retrie
                 inside = [s for s, p in hits if start <= p <= end]
                 blocks.append((max(inside, default=0.0), key, start, end))
                 start = end + 1
+    blocks.extend(attempts[:5])
     blocks.sort(key=lambda b: (-b[0], b[1], b[2]))
     return blocks
 
@@ -177,8 +216,16 @@ def build_blocks(index: UserIndex, unit_scores: dict[int, float], config: Retrie
 def render_block(
     index: UserIndex, key: str, lo: int, hi: int, show_notes: bool, show_facts: bool = False
 ) -> dict:
-    members = index.groups[key][lo : hi + 1]
     rows = index.rows
+    if key == FB_KEY:
+        row = rows[lo]
+        identity = [row["user_id"], key, row["id"]]
+        return {
+            "id": "mem_" + hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:32],
+            "content": row["content"],
+            "created_at": row["created_at"],
+        }
+    members = index.groups[key][lo : hi + 1]
     first_time = next(
         (
             rows[i]["source_timestamp_ms"]
@@ -211,4 +258,74 @@ def render_block(
         "id": "mem_" + hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:32],
         "content": "\n".join(lines),
         "created_at": rows[members[0]]["created_at"],
+    }
+
+
+def _digest_id(user_id: str, kind: str, body: str) -> str:
+    return "mem_" + hashlib.sha256(f"{user_id}\x00{kind}\x00{body}".encode()).hexdigest()[:32]
+
+
+def profile_item(index: UserIndex, scores: dict[int, float], limit: int) -> dict | None:
+    """Earlier statements the user made about themselves, picked by relevance to the question."""
+    lines, seen = [], set()
+    for unit, _ in sorted(scores.items(), key=lambda kv: -kv[1])[:40]:
+        row = index.rows[unit]
+        if row["kind"] != "msg" or row["role"] != "user":
+            continue
+        for sentence in intent.first_person_sentences(row["content"], limit=2):
+            if sentence.lower() in seen:
+                continue
+            seen.add(sentence.lower())
+            when = timeparse.unit_day(row["source_timestamp_ms"])
+            lines.append(f"- ({timeparse.fmt_day(when) if when else 'undated'}) {sentence}")
+        if len(lines) >= limit:
+            break
+    if not lines:
+        return None
+    body = "\n".join(lines[:limit])
+    first = index.rows[next(iter(scores))]
+    return {
+        "id": _digest_id(first["user_id"], "profile", body),
+        "content": "[User profile notes: things the user said about themselves earlier, "
+        "relevant for personalising the answer]\n" + body,
+        "created_at": first["created_at"],
+    }
+
+
+def outline_item(index: UserIndex, max_sessions: int = 60) -> dict | None:
+    """One line per session (date + how it opened) so overview questions see the whole history."""
+    sessions: dict[str, list[int]] = defaultdict(list)
+    for i, row in enumerate(index.rows):
+        if row["kind"] == "msg":
+            sessions[row["session_id"]].append(i)
+    if not sessions:
+        return None
+    ordered = sorted(
+        sessions.values(),
+        key=lambda members: (
+            index.rows[members[0]]["source_timestamp_ms"] or 0,
+            index.rows[members[0]]["id"],
+        ),
+    )
+    if len(ordered) > max_sessions:  # even sample keeps both ends of the timeline
+        step = (len(ordered) - 1) / (max_sessions - 1)
+        ordered = [ordered[round(k * step)] for k in range(max_sessions)]
+    lines = []
+    for members in ordered:
+        opener = next(
+            (index.rows[i] for i in members if index.rows[i]["role"] == "user"),
+            index.rows[members[0]],
+        )
+        when = timeparse.unit_day(opener["source_timestamp_ms"])
+        text = " ".join(opener["content"].split())[:170]
+        lines.append(
+            f"- {timeparse.fmt_day(when) if when else 'undated'} ({len(members)} messages): {text}"
+        )
+    body = "\n".join(lines)
+    first = index.rows[0]
+    return {
+        "id": _digest_id(first["user_id"], "outline", body),
+        "content": "[Overview of the whole history, oldest session first; one line per session]\n"
+        + body,
+        "created_at": first["created_at"],
     }
