@@ -1,3 +1,3 @@
 """PlainMemory: synchronous memory ingestion and hybrid retrieval."""
 
-__version__ = "0.8.yq"
+__version__ = "0.9.yq"
