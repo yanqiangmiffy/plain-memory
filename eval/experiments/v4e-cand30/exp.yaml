@@ -1,3 +1,0 @@
-description: v4 expanding only the top 30 fused units (default 60)
-db: ctx-on
-retrieval: {rerank: true, candidate_units: 30}

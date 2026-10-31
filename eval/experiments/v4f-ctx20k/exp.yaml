@@ -1,3 +1,0 @@
-description: v4 returning at most 20k tokens of excerpts (default 60k)
-db: ctx-on
-retrieval: {rerank: true, context_tokens: 20000}

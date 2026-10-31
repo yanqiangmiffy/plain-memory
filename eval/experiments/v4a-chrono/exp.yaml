@@ -1,3 +1,0 @@
-description: v4 with excerpts returned in chronological order instead of relevance order
-db: ctx-on
-retrieval: {rerank: true, order: chronological}

@@ -45,3 +45,5 @@ examples/gpt-4o-mini-api.py
 examples/text-embedding-v4-api.py
 
 examples
+eval/
+tests/

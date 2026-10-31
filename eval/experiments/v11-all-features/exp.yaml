@@ -1,3 +1,0 @@
-description: v6 + date boost + current-state order + profile digest + overview outline
-db: rule-notes
-retrieval: {rerank: true, rule_notes: true, date_boost: 0.03, current_state_order: true, profile_digest: true, overview_outline: true}

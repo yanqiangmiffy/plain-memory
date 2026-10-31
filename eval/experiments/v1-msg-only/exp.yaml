@@ -1,3 +1,0 @@
-description: Single messages, no context embedding, no rerank (closest to the original 0.1.0 baseline)
-db: ctx-off
-retrieval: {window_before: 0, window_after: 0, context_embedding: false, rerank: false}

@@ -1,3 +1,0 @@
-description: v6 + recommendation questions get a digest of the user's own earlier statements first
-db: rule-notes
-retrieval: {rerank: true, rule_notes: true, profile_digest: true}

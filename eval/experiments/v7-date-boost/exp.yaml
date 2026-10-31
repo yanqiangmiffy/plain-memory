@@ -1,3 +1,0 @@
-description: v6 + messages written on a date named in the question get a ranking nudge
-db: rule-notes
-retrieval: {rerank: true, rule_notes: true, date_boost: 0.03}

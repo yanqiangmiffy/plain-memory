@@ -1,3 +1,0 @@
-description: v3 + qwen3-rerank (this is the deployed 0.2.yq configuration)
-db: ctx-on
-retrieval: {rerank: true}

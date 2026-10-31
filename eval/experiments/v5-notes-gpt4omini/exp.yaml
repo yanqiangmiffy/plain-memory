@@ -1,4 +1,0 @@
-description: v4 + gpt-4o-mini time notes and fact index at Add (costs OpenRouter credit; the server cannot reach OpenRouter, so online use needs a relay)
-db: notes
-llm: gpt-4o-mini
-retrieval: {rerank: true, add_notes: true}

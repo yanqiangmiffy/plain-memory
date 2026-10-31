@@ -1,3 +1,0 @@
-description: v12 + every intent-gated presentation switch (sequence / current-state order, profile digest, overview outline)
-db: wide-time
-retrieval: {rerank: true, rule_notes: true, sequence_order: true, current_state_order: true, profile_digest: true, overview_outline: true}
