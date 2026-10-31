@@ -83,11 +83,13 @@ class RetrievalConfig(BaseModel):
     feedback_pass_boost: float = Field(default=1.2, gt=0)
     feedback_fail_penalty: float = Field(default=0.35, gt=0)
     current_state_order: bool = False  # current-state questions: newest excerpts first
+    sequence_order: bool = False  # "which came first / in what order" questions: oldest first
     profile_digest: bool = False  # recommendation questions: prepend the user's own statements
     profile_items: int = Field(default=5, ge=1, le=12)
     overview_outline: bool = False  # overview questions: per-session outline + session round-robin
     redact_secrets: bool = True  # mask credentials in returned text unless the question asks
     option_views: bool = False  # multiple choice: also retrieve with each option as a hypothesis
+    structured_state: bool = True  # source-backed view of explicit structured fact updates
     query_expansion: bool = False  # LLM: sub-queries at Search
     rerank: bool = False
     order: Literal["relevance", "chronological"] = "relevance"  # order of returned excerpts
@@ -114,6 +116,9 @@ class Settings(BaseModel):
     max_body_bytes: int = Field(default=16 * 1024 * 1024, ge=1)
     add_concurrency: int = Field(default=16, ge=16, le=64)
     search_concurrency: int = Field(default=16, ge=16, le=256)
+    # Per-user search indexes kept in memory: how many users, and how many stored units in total.
+    index_cache_users: int = Field(default=32, ge=1)
+    index_cache_units: int = Field(default=100_000, ge=1000)
     add_timeout_seconds: float = Field(default=600, gt=0)
     search_timeout_seconds: float = Field(default=120, gt=0)
     request_journal: Path | None = None  # JSON-lines file with full Add/Search requests+responses

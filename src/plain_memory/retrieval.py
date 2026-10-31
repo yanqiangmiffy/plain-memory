@@ -1,18 +1,19 @@
-"""Per-user hybrid retrieval: dense + BM25 (bm25s) -> RRF -> window blocks -> optional rerank."""
+"""Per-user hybrid retrieval: FAISS dense + BM25 -> RRF -> window blocks -> optional rerank."""
 
 import hashlib
 import json
 import threading
 from collections import OrderedDict, defaultdict
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
-
-import bm25s
-import numpy as np
 
 from plain_memory import intent, timeparse
 from plain_memory.config import RetrievalConfig
 from plain_memory.embedding import EmbeddingError
+from plain_memory.lexical import BM25Index
+from plain_memory.state import StructuredState
 from plain_memory.text import lexical_terms
+from plain_memory.vectors import DenseIndex
 
 FB_KEY = "\x00feedback"  # pseudo group key of single graded-attempt excerpts
 
@@ -43,7 +44,7 @@ def format_time(timestamp_ms: int | None) -> str | None:
 def _speaker_prefixed(row: dict) -> str:
     head = row["content"][:48]
     colon = head.find(":")
-    if 0 < colon <= 40 and "\n" not in head[:colon]:
+    if 0 < colon <= 40 and not any(c in head[:colon] for c in "\n[]{}"):
         return row["content"]
     return f"{row['role']}: {row['content']}"
 
@@ -53,12 +54,24 @@ class UserIndex:
 
     def __init__(self, rows: list[dict]):
         try:
-            self.matrix = np.stack([np.frombuffer(row["embedding"], dtype="<f4") for row in rows])
-            if not np.isfinite(self.matrix).all():
-                raise ValueError
+            self.vector_index = DenseIndex(row["embedding"] for row in rows)
         except (ValueError, TypeError):
             raise EmbeddingError("Stored vectors are invalid.") from None
-        self.rows = rows
+        # Read-time interpretation also repairs legacy databases without
+        # changing stored vectors or treating a mentioned birthday as a timestamp.
+        inferred = {
+            (r["request_id"], r["message_index"]): timeparse.message_timestamp(r["content"])
+            for r in rows
+            if r["chunk_index"] == 0 and r["source_timestamp_ms"] is None
+        }
+        # FAISS now owns the vectors; keeping the packed copy as well would double the memory.
+        self.rows = rows = [{k: v for k, v in r.items() if k != "embedding"} for r in rows]
+        for row in rows:
+            stamp = inferred.get((row["request_id"], row["message_index"]))
+            if row["source_timestamp_ms"] is None and stamp is not None:
+                row["source_timestamp_ms"] = stamp
+                row["created_at"] = timeparse.moment_of(stamp).isoformat().replace("+00:00", "Z")
+        self.structured = StructuredState(rows)
         self.days = [
             timeparse.unit_day(row["source_timestamp_ms"]).toordinal()
             if row["source_timestamp_ms"] is not None and row["kind"] == "msg"
@@ -68,10 +81,7 @@ class UserIndex:
         self.feedback = {i: row["note"] for i, row in enumerate(rows) if row["kind"] == "fb"}
         terms = [json.loads(row["terms_json"]) for row in rows]
         self.searchable = [i for i, t in enumerate(terms) if t]
-        self.bm25 = None
-        if self.searchable:
-            self.bm25 = bm25s.BM25()
-            self.bm25.index([terms[i] for i in self.searchable], show_progress=False)
+        self.bm25 = BM25Index([terms[i] for i in self.searchable]) if self.searchable else None
         groups = defaultdict(list)
         for i, row in enumerate(rows):
             if row["kind"] == "msg":
@@ -105,49 +115,75 @@ class UserIndex:
             if day is not None and any(a <= day <= b for a, b in spans)
         ]
 
-    def dense(self, vector: np.ndarray, limit: int) -> list[int]:
-        if self.matrix.shape[1] != len(vector):
-            raise EmbeddingError("Stored vectors are incompatible with the query model.")
-        sims = self.matrix @ vector
-        return list(np.argsort(-sims, kind="stable")[:limit])
+    def dense(self, vector: Sequence[float], limit: int) -> list[int]:
+        try:
+            return self.vector_index.search(vector, limit)
+        except (ValueError, TypeError, OverflowError):
+            raise EmbeddingError("Stored vectors are incompatible with the query model.") from None
 
     def lexical(self, query: str, limit: int) -> list[int]:
         tokens = lexical_terms(query)
         if self.bm25 is None or not tokens:
             return []
-        scores = self.bm25.get_scores(tokens)
-        order = np.argsort(-scores, kind="stable")[:limit]
-        return [self.searchable[j] for j in order if scores[j] > 0]
+        return [self.searchable[j] for j in self.bm25.top(tokens, limit)]
 
 
 class IndexCache:
-    def __init__(self, capacity: int = 8):
+    """LRU of per-user indexes, bounded by user count and by the units they hold in total.
+
+    Rebuilding one user's index (seconds for a very long history) takes only a builder lock
+    chosen by user id, so searches for every other user keep running meanwhile.
+    """
+
+    STRIPES = 64
+
+    def __init__(self, capacity: int = 32, max_units: int = 100_000):
         self.capacity = capacity
+        self.max_units = max_units
         self.items: OrderedDict[str, tuple[tuple, UserIndex]] = OrderedDict()
         self.lock = threading.Lock()
+        self.builders = [threading.Lock() for _ in range(self.STRIPES)]
+
+    def _hit(self, user_id: str, fingerprint: tuple) -> UserIndex | None:
+        """Cached index for an unchanged user; the caller holds `self.lock`."""
+        cached = self.items.get(user_id)
+        if cached and cached[0] == fingerprint:
+            self.items.move_to_end(user_id)
+            return cached[1]
+        return None
+
+    def _evict(self) -> None:
+        """Drop least-recently-used users, but never the one just stored."""
+        units = sum(len(index.rows) for _, index in self.items.values())
+        while len(self.items) > 1 and (len(self.items) > self.capacity or units > self.max_units):
+            _, (_, index) = self.items.popitem(last=False)
+            units -= len(index.rows)
 
     def get(self, store, user_id: str) -> UserIndex | None:
         fingerprint = store.fingerprint(user_id)
         if fingerprint[0] == 0:
             return None
         with self.lock:
-            cached = self.items.get(user_id)
-            if cached and cached[0] == fingerprint:
-                self.items.move_to_end(user_id)
-                return cached[1]
-            rows = store.snapshot(user_id)
-            index = UserIndex(rows)
-            self.items[user_id] = (fingerprint, index)
-            self.items.move_to_end(user_id)
-            while len(self.items) > self.capacity:
-                self.items.popitem(last=False)
+            index = self._hit(user_id, fingerprint)
+        if index is not None:
             return index
+        with self.builders[hash(user_id) % self.STRIPES]:
+            with self.lock:  # another thread may have built it while this one waited
+                index = self._hit(user_id, fingerprint)
+            if index is not None:
+                return index
+            index = UserIndex(store.snapshot(user_id))
+            with self.lock:
+                self.items[user_id] = (fingerprint, index)
+                self.items.move_to_end(user_id)
+                self._evict()
+        return index
 
 
 def fuse(
     index: UserIndex,
     queries: list[tuple[str, float]],
-    vectors: np.ndarray,
+    vectors: Sequence[Sequence[float]],
     config: RetrievalConfig,
     original_query: str = "",
 ) -> dict[int, float]:
@@ -214,7 +250,13 @@ def build_blocks(index: UserIndex, unit_scores: dict[int, float], config: Retrie
 
 
 def render_block(
-    index: UserIndex, key: str, lo: int, hi: int, show_notes: bool, show_facts: bool = False
+    index: UserIndex,
+    key: str,
+    lo: int,
+    hi: int,
+    show_notes: bool,
+    show_facts: bool = False,
+    show_state: bool = True,
 ) -> dict:
     rows = index.rows
     if key == FB_KEY:
@@ -236,16 +278,18 @@ def render_block(
     )
     header = format_time(first_time)
     lines = [f"[Conversation excerpt{' | ' + header if header else ''}]"]
-    seen_day = None
-    if first_time is not None:
-        seen_day = format_time(first_time).split(", ")[1]
+    seen_time = first_time
     facts = []
     for i in members:
         row = rows[i]
         text = _speaker_prefixed(row)
         stamp = row["source_timestamp_ms"]
-        if stamp is not None and format_time(stamp).split(", ")[1] != seen_day:
+        if stamp is not None and stamp != seen_time:
             text = f"({format_time(stamp)}) {text}"
+            seen_time = stamp
+        if show_state and i in index.structured.superseded:
+            target = index.structured.superseded[i]
+            text = f"[Historical fact; explicitly replaced by source {rows[target]['id']}] " + text
         lines.append(text)
         if show_notes and row["note"]:
             lines.append(f"  (time note: {row['note']})")
@@ -263,6 +307,29 @@ def render_block(
 
 def _digest_id(user_id: str, kind: str, body: str) -> str:
     return "mem_" + hashlib.sha256(f"{user_id}\x00{kind}\x00{body}".encode()).hexdigest()[:32]
+
+
+def structured_item(index: UserIndex, query: str) -> dict | None:
+    units = index.structured.connected(query)
+    if not units:
+        return None
+    lines = [
+        "[Structured evidence from supplied memory; explicit replacements applied. "
+        "These are source assertions, not external world knowledge. "
+        "Multiple values without an explicit replacement remain unresolved.]"
+    ]
+    for unit in units:
+        fact, row = index.structured.facts[unit], index.rows[unit]
+        labels = " | ".join(
+            json.dumps(v, ensure_ascii=False) for v in (fact.subject, fact.relation, fact.object)
+        )
+        lines.append(f"- {labels} (source: {row['id']})")
+    body = "\n".join(lines)
+    return {
+        "id": _digest_id(index.rows[units[0]]["user_id"], "structured-state", body),
+        "content": body,
+        "created_at": max(index.rows[i]["created_at"] for i in units),
+    }
 
 
 def profile_item(index: UserIndex, scores: dict[int, float], limit: int) -> dict | None:

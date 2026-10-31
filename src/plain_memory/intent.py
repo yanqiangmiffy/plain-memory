@@ -27,8 +27,23 @@ _GLOBAL = re.compile(
 )
 
 
+_SEQUENCE = re.compile(
+    r"\b(?:in what order|order (?:of|in which)|chronolog\w*|timeline|sequence of|"
+    r"which\b[^?.]{0,40}\b(?:first|earlier|earliest|later|latest)\b|"
+    r"(?:happened|came|occurred|started|began|finished|ended)\s+(?:first|last|before|after)|"
+    r"before or after|"
+    r"(?:earliest|first) to (?:last|latest)|from (?:first|earliest) to (?:last|latest))\b",
+    re.I,
+)
+
+
 def wants_current_state(query: str) -> bool:
     return bool(_CURRENT.search(query))
+
+
+def wants_sequence(query: str) -> bool:
+    """Questions about which event came first/last or in what order things happened."""
+    return bool(_SEQUENCE.search(query))
 
 
 def wants_recommendation(query: str) -> bool:

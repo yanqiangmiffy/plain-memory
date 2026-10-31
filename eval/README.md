@@ -73,6 +73,42 @@ eval/
 - `v5-notes-gpt4omini` 会在写入阶段调用 OpenRouter 的 gpt-4o-mini，消耗额度；其余实验不调用 LLM 组件。
 - 密钥只放在项目根目录的 `.env`（已被 git 忽略），实验目录里不放任何密钥。
 
+## 用线上日志定位 badcase
+
+在保存日志的服务器执行 `audit_journal.py`。它统计真实 Search 调用、重复选项、
+长上下文、正文时间和显式事实更新；只有匹配到后续在线评分反馈的调用才标记对错。
+Search 调用数不等于官方计分题数，没有反馈的调用不能视为答错。
+
+```bash
+python eval/audit_journal.py --journal data/journal/requests.jsonl \
+  --since 2026-10-29T03:04:17+00:00 --until 2026-10-29T03:43:06+00:00 \
+  --out data/analysis/audit.json
+```
+
+用 `replay_journal.py` 分别回放基准和候选代码。每次回放只使用该用户在 Search
+开始之前完成的 Add，排除未来更新、后续评分和其他用户的数据。数据库只读，
+不重新 Add，不调用回答模型；查询 embedding 缓存写入独立文件。
+当前工具要求配置中的 rerank 和 query_expansion 关闭，否则退出，避免静默改变实验条件。
+
+```bash
+PYTHONPATH=/path/to/baseline/src python eval/replay_journal.py \
+  --config /path/to/config.local.yaml --journal data/journal/requests.jsonl \
+  --since 2026-10-29T03:04:17+00:00 --until 2026-10-29T03:43:06+00:00 \
+  --cache data/analysis/query-cache.sqlite3 --out data/analysis/baseline.json
+
+PYTHONPATH=/path/to/candidate/src python eval/replay_journal.py \
+  --config /path/to/config.local.yaml --journal data/journal/requests.jsonl \
+  --since 2026-10-29T03:04:17+00:00 --until 2026-10-29T03:43:06+00:00 \
+  --cache data/analysis/query-cache.sqlite3 --out data/analysis/candidate.json
+
+python eval/compare_journal.py --baseline data/analysis/baseline.json \
+  --candidate data/analysis/candidate.json --out data/analysis/comparison.json
+```
+
+比较工具检查历史内容的哈希完全相同，并按片段 ID 比较时间，避免把排序变化误算成
+时间修复。日志及回放结果包含原始文本，应留在服务器；可仅带回不含原文的比较结果。
+这类回放验证检索行为，不产出新准确率。分数提升仍需固定回答模型的配对评测或官方评测。
+
 ## 通宵实验（免费 Qwen，一条命令）
 
 ```bash

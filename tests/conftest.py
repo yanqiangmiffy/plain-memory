@@ -1,6 +1,5 @@
 import hashlib
 
-import numpy as np
 import pytest
 
 from plain_memory.config import Settings
@@ -17,12 +16,12 @@ class FakeEmbedder:
         self.calls.append(texts)
         result = []
         for text in texts:
-            vector = np.zeros(32, dtype=np.float32)
+            vector = [0.0] * 32
             for term in lexical_terms(text) or [text]:
                 position = int.from_bytes(hashlib.sha256(term.encode()).digest()[:4], "little") % 32
                 vector[position] += 1
             result.append(vector)
-        return np.array(result)
+        return result
 
     def close(self):
         pass

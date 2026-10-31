@@ -3,12 +3,12 @@
 import hashlib
 import json
 import sqlite3
+from array import array
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
-import numpy as np
-
 from plain_memory.config import Settings
+from plain_memory.vectors import pack_vector
 
 
 class RequestConflict(Exception):
@@ -87,14 +87,14 @@ class Store:
         with self.connection() as conn:
             return self._completed(conn, payload["user_id"], payload["request_id"], digest)
 
-    def commit(self, payload: dict, digest: str, prepared: list[dict], vectors: np.ndarray | None):
+    def commit(self, payload: dict, digest: str, prepared: list[dict], vectors: list[array] | None):
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         with self.connection() as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             if self._completed(conn, payload["user_id"], payload["request_id"], digest):
                 return
             if vectors is not None:
-                dimension = str(vectors.shape[1])
+                dimension = str(len(vectors[0]))
                 conn.execute("INSERT OR IGNORE INTO meta VALUES ('dimensions', ?)", (dimension,))
                 stored_dimension = conn.execute(
                     "SELECT value FROM meta WHERE key='dimensions'"
@@ -144,7 +144,7 @@ class Store:
                         timestamp,
                         chunk["content"],
                         canonical(chunk["terms"]),
-                        vectors[index].tobytes(),
+                        pack_vector(vectors[index]),
                         created_at,
                         chunk.get("kind", "msg"),
                         chunk.get("note"),

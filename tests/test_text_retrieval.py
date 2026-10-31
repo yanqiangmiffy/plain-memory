@@ -1,6 +1,5 @@
 import json
 
-import numpy as np
 import pytest
 
 from plain_memory.api import create_app
@@ -8,6 +7,7 @@ from plain_memory.config import RetrievalConfig
 from plain_memory.retrieval import UserIndex, build_blocks, fuse, interleave, render_block
 from plain_memory.store import StoreMismatch
 from plain_memory.text import chunks, encoding, lexical_terms
+from plain_memory.vectors import pack_vector
 
 
 def test_unicode_chunks_are_original_substrings_and_cover_message():
@@ -52,7 +52,7 @@ def make_rows(texts, kind="msg", request="r1", note=None):
                 "source_timestamp_ms": 1704067200000,
                 "created_at": "2024-01-01T00:00:00Z",
                 "terms_json": json.dumps(lexical_terms(text)),
-                "embedding": np.ones(4, dtype="<f4").tobytes(),
+                "embedding": pack_vector([1.0] * 4),
                 "kind": kind,
                 "note": note if i == 0 else None,
                 "content": text,
@@ -71,8 +71,8 @@ def test_blocks_expand_merge_and_render_with_date_and_notes():
     rows = make_rows(texts, note="yesterday = 31 December 2023")
     index = UserIndex(rows)
     config = RetrievalConfig(window_before=1, window_after=1, candidate_units=1)
-    query = np.ones(4, dtype=np.float32)
-    scores = fuse(index, [("orchid", 1.0)], np.array([query]), config)
+    query = [1.0] * 4
+    scores = fuse(index, [("orchid", 1.0)], [query], config)
     blocks = build_blocks(index, scores, config)
     assert blocks[0][1:] == ("r1", 7, 8)  # orchid hit expands to its neighbour only
     item = render_block(index, "r1", 0, 1, True)
@@ -85,10 +85,10 @@ def test_fact_hits_map_back_to_their_source_message():
     rows = make_rows(["Alice: hi", "Bob: bye", "Carol: ok"])
     fact = make_rows(["Alice adopted an orchid."], kind="fact")[0]
     fact["message_index"] = 2
-    fact["embedding"] = (-np.ones(4, dtype="<f4")).tobytes()
+    fact["embedding"] = pack_vector([-1.0] * 4)
     index = UserIndex(rows + [fact])
     config = RetrievalConfig(window_before=0, window_after=0, candidate_units=1)
-    scores = fuse(index, [("orchid", 1.0)], np.array([np.ones(4, dtype=np.float32)]), config)
+    scores = fuse(index, [("orchid", 1.0)], [[1.0] * 4], config)
     (score, key, lo, hi), *_ = build_blocks(index, scores, config)
     assert (key, lo, hi) == ("r1", 2, 2)
     assert "Alice adopted an orchid." in render_block(index, key, lo, hi, True, True)["content"]

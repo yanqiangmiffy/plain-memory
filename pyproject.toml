@@ -4,14 +4,12 @@ version = "0.1.0"
 description = "A small synchronous Add/Search memory service for AML."
 requires-python = ">=3.11"
 dependencies = [
-  "bm25s>=0.3.15",
+  "faiss-cpu>=1.12,<2",
   "fastapi>=0.115,<1",
   "httpx>=0.28,<1",
-  "numpy>=2,<3",
   "pydantic>=2.10,<3",
   "pystemmer>=3.1.0",
   "PyYAML>=6,<7",
-  "rank-bm25>=0.2.2,<0.3",
   "tiktoken>=0.9,<1",
   "uvicorn>=0.34,<1",
 ]

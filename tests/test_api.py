@@ -2,7 +2,6 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-import numpy as np
 from fastapi.testclient import TestClient
 
 from plain_memory.api import create_app
@@ -65,6 +64,34 @@ def test_user_run_isolation_and_cross_session(settings, fake, headers):
         calls = len(fake.calls)
         assert search(client, headers, user="unknown-user").json() == {"data": []}
         assert len(fake.calls) == calls
+
+
+def test_cached_index_refreshes_after_add_and_purge(settings, fake, headers):
+    app = create_app(settings, embedder=fake)
+    with TestClient(app) as client:
+        assert client.post("/add", headers=headers, json=memory()).status_code == 200
+        assert len(search(client, headers).json()["data"]) == 1
+        assert (
+            client.post(
+                "/add",
+                headers=headers,
+                json=memory(request="req-2", session="s2", text="Orchid blooming in spring"),
+            ).status_code
+            == 200
+        )
+        assert len(search(client, headers).json()["data"]) == 2
+        app.state.store.purge("run:1:user:1")
+        assert search(client, headers).json() == {"data": []}
+        assert (
+            client.post(
+                "/add",
+                headers=headers,
+                json=memory(request="req-3", text="New orchid memory"),
+            ).status_code
+            == 200
+        )
+        data = search(client, headers).json()["data"]
+        assert len(data) == 1 and "New orchid memory" in data[0]["content"]
 
 
 def test_options_top_k_and_message_order(settings, fake, headers):
@@ -206,7 +233,7 @@ def test_changed_dimension_fails_without_partial_write(settings, fake, headers):
     app = create_app(settings, embedder=fake)
     with TestClient(app) as client:
         assert client.post("/add", headers=headers, json=memory()).status_code == 200
-        fake.embed = lambda texts, deadline: np.ones((len(texts), 8))
+        fake.embed = lambda texts, deadline: [[1.0] * 8 for _ in texts]
         assert client.post("/add", headers=headers, json=memory(request="req-2")).status_code == 503
         assert len(app.state.store.snapshot("run:1:user:1")) == 1
         assert search(client, headers).status_code == 503
@@ -261,7 +288,9 @@ def test_expired_add_never_commits(settings, fake, headers):
     original = fake.embed
 
     def slow(texts, deadline):
-        time.sleep(0.01)
+        # Windows' monotonic clock can tick more slowly than a 10 ms sleep.
+        while time.monotonic() <= deadline:
+            time.sleep(0.01)
         return original(texts, deadline)
 
     fake.embed = slow

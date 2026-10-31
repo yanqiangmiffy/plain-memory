@@ -1,21 +1,63 @@
-**服务器已经重新部署，但日志没开。**
+# PlainMemory
 
-在服务器上追加这个开关，再重启：
+同步 Add/Search 记忆服务：SQLite 保存原始消息和向量，FAISS CPU + BM25 召回，
+RRF 融合后扩展上下文窗口，可选重排。Search 返回证据，由评测平台生成答案。
 
-```bash
-printf '\nrequest_log: true\n' >> ~/plain-memory/config.local.yaml
+## 安装与验证
+
+```powershell
+uv sync --frozen
+uv run pytest -q
+uv run ruff check src tests
 ```
 
-```bash
-cd ~/plain-memory && kill $(cat run.pid) && sleep 1 && ./start.sh
-```
+启动配置沿用本地 `config.local.yaml`。本次代码修改不会自动重启或部署线上服务。
+
+## FAISS CPU 迁移（2026-10-29）
+
+- 使用 `faiss-cpu` 的 `IndexFlatIP`，在已归一化向量上做精确内积检索；没有近似搜索的召回损失。
+- `src` 和测试代码不直接使用 NumPy。向量缓冲区、归一化和序列化使用标准库 `array` / `math`，
+  有效性检查通过 FAISS 原生范数计算加速；
+  0.7.yq 起词法检索也不再依赖 bm25s（见下文）；NumPy 现在只作为 `faiss-cpu` 的间接依赖安装。
+- 保留 SQLite 的小端 float32 向量格式、模型标识和按用户隔离；现有数据库无需重新 embedding。
+  每个用户的内存索引由 SQLite 重建，并沿用原来的缓存失效机制。
+- 相同得分按写入顺序稳定排序；FAISS 每次搜索使用一个 CPU 线程，避免与 HTTP 并发叠加。
+  原生调用前检查维度、有限值和缓冲区类型，调用期间保留缓冲区引用。
+- 精确搜索仍为 O(Nd)。短历史不保证比原实现快，索引缓存未命中时仍需完整重建；
+  超长历史应另行评估增量索引、内存预算和 HNSW 的速度/召回取舍。
+- 返回片段的 token 总量包括摘要和画像；跳过放不下的后续片段并继续寻找较短证据。
+  首个证据过长时显式标注截断。所有摘要合计最多占总 token 预算的四分之一。
+
+验证覆盖精确检索与标量计算一致性、并发搜索、同分边界、旧向量格式、非法向量、
+写入后的索引刷新、删除、服务重启、用户隔离和上下文预算。
+
+## 日志分析与候选优化（2026-10-29）
+
+线上服务当前是 `0.5.yq`，已开启请求日志：
+`/home/yanqiang/plain-memory/data/journal/requests.jsonl`。
+本轮新增优化已在服务器研究目录完成 48 次历史检索回放；正式部署记录保存在
+发布目录的 `deployment.json`，发布目录可更新而接口版本号保持不变。
+
+- `structured_state` 默认开启：对结构化事实的显式替换构建带来源的当前关系链，
+  原始事实仍保留并标注被替换。没有替换声明的矛盾不会被自动判定为新值胜出。
+  历史时间问题不添加当前关系视图；此功能不包含题目 ID、实体答案或外部常识。
+- 缺少独立时间字段时，从开头的 `[Time: ...]` 读取时间，修复旧数据库的检索视图，
+  不改写原文或已有向量。无时区时间沿用 UTC 约定；显式时间字段优先。
+- 避免把题面已有的完整选项再次加入检索文本；保留用户和助手的角色标识。
+- 新增日志审计、历史回放和比较脚本，见 [eval/README.md](eval/README.md)。
+  回放排除问题之后的更新和评分反馈，检查历史内容哈希一致。
+
+此次回放在 6 次调用中生成了更新后的关系链，在另外 6 次调用中修复了相同片段的
+时间字段。平均返回文本由 5,792 增至 6,058 tokens（约 +4.6%）；这些是检索行为的
+变化，不能据此宣称官方分数已经提升。
 
 
-重启后用这条命令验证：
+## 0.7.yq（2026-10-31，未部署）
 
-```bash
-curl -s http://127.0.0.1:8600/health; echo; tail -n 5 serve.log
-```
-
-应该能看到一行 `GET /health 200 …`。
-
+- 词法检索改为自实现的纯 Python BM25（`src/plain_memory/lexical.py`），移除 bm25s 和 rank-bm25；
+  与 bm25s 的分数差小于 1e-6，前 20 名顺序一致。NumPy 现在只作为 `faiss-cpu` 的间接依赖安装。
+- 索引缓存按用户数和切片总数限制，重建一个用户的索引不再阻塞其他用户的 Search。
+- `rule_notes` 覆盖更多相对时间说法（季节、月份名、"in two weeks"、this week/weekend 等）；
+  新增默认关闭的 `sequence_order`，只对"哪个先发生/按什么顺序"这类问题按时间升序返回证据。
+- 新增 `eval/audit_streaming.py`：在保存请求日志的机器上统计流式用户的服务情况，只输出数字。
+- 分析和验证见 [docs/optimization-0.7.md](docs/optimization-0.7.md)。开启 `rule_notes` 需要新数据库。

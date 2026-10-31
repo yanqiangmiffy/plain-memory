@@ -18,7 +18,7 @@ Add 在同一个 HTTP 请求内完成切片、全部 embedding 和 SQLite 事务
 - 本地 SQLite WAL/FULL 是唯一持久化存储；不使用分布式数据库、向量数据库或常驻向量/BM25 索引。
 - Add 并发上限 16，Search 并发上限 16；超过上限立即返回 HTTP 429 和 `Retry-After: 1`。
 - 单个 POST 请求体上限 16 MiB，超限返回 413；Add 服务截止时间 120 秒，Search 为 30 秒。
-- 已验证 `top_k=100`；更大规模尚未压测。每次 Search 在目标用户的全部切片上执行 O(Nd) 的 NumPy 余弦计算并现场构建 BM25，因此定位为 Smoke/小规模服务，延迟和内存会随该用户切片数线性增长。
+- 已验证 `top_k=100`；更大规模尚未压测。每个用户的稠密索引（FAISS `IndexFlatIP` 精确内积，O(Nd)）与词法索引（自实现 BM25）按用户缓存在内存中，缓存按用户数和切片总数设上限；缓存未命中或该用户有新写入时需从 SQLite 重建，延迟和内存随该用户切片数线性增长，尚未做 Full 规模压测。
 - 默认每条消息按 cl100k_base 计数切为 512 token，重叠 64 token；短消息直接保存。该计数口径不等于 embedding 供应商 tokenizer。
 - embedding 是外部 HTTP 依赖；供应商限流、网络故障、模型限制或数据库故障会返回 4xx/503。当前没有经过 Full 规模、长期稳定性、Docker 或正式 text-embedding-v4 容量测试。
 
@@ -47,7 +47,7 @@ PlainMemory 是独立的最小 Python 实现；OpenViking 和 DeepRead 不是运
 在上述改动之上，v2 版本的方法变化如下；全部代码见仓库 `src/plain_memory/`。
 
 1. **上下文窗口返回：** 命中的消息向前、向后各扩展 2 条并合并重叠，作为一个带星期/日期头的“对话摘录”返回；每条消息的向量文本带日期和前一条消息。
-2. **混合检索：** `text-embedding-v4` 稠密检索 + bm25s（英文词干化、停用词；中文单字双字）；加权 RRF 融合，按用户缓存索引。
+2. **混合检索：** `text-embedding-v4` 稠密检索（FAISS CPU 精确内积）+ 自实现 BM25（Lucene 变体，k1=1.5，b=0.75；英文词干化、停用词；中文单字双字）；加权 RRF 融合，按用户缓存索引。
 3. **重排（不受限）：** DashScope `qwen3-rerank` 对候选摘录重排，与 RRF 分数 7:3 融合。
 4. **可选 gpt-4o-mini 增强（默认关闭，当前线上未启用）：** Add 阶段生成相对时间解析备注和原子事实索引；Search 阶段生成子查询。启用时是本方法中唯一的 LLM 组件，模型为 gpt-4o-mini。线上当前配置 `add_notes=false`、`query_expansion=false`，因此没有任何 LLM 组件。
 5. 本地离线评测脚本在 `eval/`（LoCoMo-Refined 与 LongMemEval-S 子集，回答与评分使用 gpt-4o-mini 代替官方模型，仅供相对比较）。

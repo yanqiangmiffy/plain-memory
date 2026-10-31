@@ -7,10 +7,11 @@ a real evaluation it falls under the same 30-day deletion duty as the main datab
 
 import hashlib
 import sqlite3
+from array import array
 from contextlib import closing
 from pathlib import Path
 
-import numpy as np
+from plain_memory.vectors import pack_vector, unpack_vector
 
 
 class EmbeddingCache:
@@ -33,8 +34,8 @@ class EmbeddingCache:
     def key(self, text: str) -> str:
         return hashlib.sha256(f"{self.namespace}\x00{text}".encode()).hexdigest()
 
-    def get_many(self, keys: list[str]) -> dict[str, np.ndarray]:
-        found: dict[str, np.ndarray] = {}
+    def get_many(self, keys: list[str]) -> dict[str, array]:
+        found: dict[str, array] = {}
         with closing(self._connect()) as conn:
             for start in range(0, len(keys), 500):
                 chunk = keys[start : start + 500]
@@ -42,14 +43,17 @@ class EmbeddingCache:
                 for key, blob in conn.execute(
                     f"SELECT key, vec FROM cache WHERE key IN ({marks})", chunk
                 ):
-                    found[key] = np.frombuffer(blob, dtype="<f4")
+                    try:
+                        found[key] = unpack_vector(blob)
+                    except (ValueError, TypeError):
+                        continue  # disposable corrupt entries are re-embedded
         return found
 
-    def put_many(self, items: dict[str, np.ndarray]):
+    def put_many(self, items: dict[str, array]):
         with closing(self._connect()) as conn:
             conn.executemany(
                 "INSERT OR REPLACE INTO cache VALUES (?, ?)",
-                [(key, np.asarray(vec, dtype="<f4").tobytes()) for key, vec in items.items()],
+                [(key, pack_vector(vec)) for key, vec in items.items()],
             )
             conn.commit()
 

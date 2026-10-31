@@ -241,7 +241,7 @@ def create_app(settings: Settings, *, embedder=None, llm=None, reranker=None) ->
         llm = LLM(settings.llm)
     if reranker is None and settings.rerank is not None and settings.retrieval.rerank:
         reranker = Reranker(settings.rerank)
-    cache = IndexCache()
+    cache = IndexCache(settings.index_cache_users, settings.index_cache_units)
     journal = (
         Journal(settings.request_journal, settings.journal_max_bytes)
         if settings.request_journal is not None

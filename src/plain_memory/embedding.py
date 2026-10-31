@@ -1,12 +1,13 @@
 """只实现首版需要的两个 HTTP 编码格式，不记录请求或上游响应正文。"""
 
 import time
+from array import array
 
 import httpx
-import numpy as np
 
 from plain_memory.config import EmbeddingConfig
 from plain_memory.embed_cache import EmbeddingCache
+from plain_memory.vectors import normalize
 
 RETRY_ATTEMPTS = 5
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
@@ -18,17 +19,9 @@ class EmbeddingError(Exception):
         self.status = status
 
 
-def normalize_vectors(values, count: int, dimensions: int | None = None) -> np.ndarray:
+def normalize_vectors(values, count: int, dimensions: int | None = None) -> list[array]:
     try:
-        array = np.asarray(values, dtype=np.float32)
-        if array.ndim != 2 or array.shape[0] != count or array.shape[1] == 0:
-            raise ValueError
-        if dimensions is not None and array.shape[1] != dimensions:
-            raise ValueError
-        norms = np.linalg.norm(array, axis=1, keepdims=True)
-        if not np.isfinite(array).all() or not np.isfinite(norms).all() or (norms <= 0).any():
-            raise ValueError
-        return np.asarray(array / norms, dtype="<f4")
+        return normalize(values, count, dimensions)
     except (ValueError, TypeError, OverflowError):
         raise EmbeddingError("Embedding returned invalid vectors or a changed dimension.") from None
 
@@ -81,7 +74,7 @@ class HTTPEmbedder:
             delay = min(delay * 2, 8.0)
         raise AssertionError("unreachable")
 
-    def embed(self, texts: list[str], deadline: float) -> np.ndarray:
+    def embed(self, texts: list[str], deadline: float) -> list[array]:
         if self.cache is None or not texts:
             return self._embed(texts, deadline)
         keys = [self.cache.key(text) for text in texts]
@@ -94,7 +87,7 @@ class HTTPEmbedder:
             found.update(added)
         return normalize_vectors([found[key] for key in keys], len(texts), self.config.dimensions)
 
-    def _embed(self, texts: list[str], deadline: float) -> np.ndarray:
+    def _embed(self, texts: list[str], deadline: float) -> list[array]:
         vectors = []
         batch_size = 1 if self.config.protocol == "doubao_multimodal" else self.config.batch_size
         for start in range(0, len(texts), batch_size):

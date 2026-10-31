@@ -2,7 +2,6 @@ import json
 import time
 
 import httpx
-import numpy as np
 import pytest
 
 from plain_memory.config import EmbeddingConfig
@@ -58,7 +57,7 @@ def test_standard_batch_respects_response_indexes():
     try:
         vectors = embedder.embed(["1", "2", "3"], time.monotonic() + 10)
         assert [len(call["input"]) for call in calls] == [2, 1]
-        np.testing.assert_allclose(vectors, normalize_vectors([[1, 1], [2, 1], [3, 1]], 3))
+        assert vectors == normalize_vectors([[1, 1], [2, 1], [3, 1]], 3)
     finally:
         embedder.close()
 
@@ -77,7 +76,8 @@ def test_doubao_multimodal_encodes_each_chunk_independently():
 
     embedder = HTTPEmbedder(config("doubao_multimodal"), transport=httpx.MockTransport(handle))
     try:
-        assert embedder.embed(["first", "second"], time.monotonic() + 10).shape == (2, 3)
+        vectors = embedder.embed(["first", "second"], time.monotonic() + 10)
+        assert len(vectors) == 2 and all(len(v) == 3 for v in vectors)
         assert [call["input"][0]["text"] for call in calls] == ["first", "second"]
     finally:
         embedder.close()
@@ -135,9 +135,9 @@ def test_embedding_cache_reuses_vectors_and_dedupes(tmp_path):
     embedder = HTTPEmbedder(cfg, transport=httpx.MockTransport(handle))
     try:
         first = embedder.embed(["aa", "bbb", "aa"], time.monotonic() + 10)
-        assert calls == [["aa", "bbb"]] and first.shape == (3, 2)
+        assert calls == [["aa", "bbb"]] and len(first) == 3 and all(len(v) == 2 for v in first)
         again = embedder.embed(["bbb", "aa", "cccc"], time.monotonic() + 10)
         assert calls[1:] == [["cccc"]]
-        assert np.allclose(again[0], first[1]) and np.allclose(again[1], first[0])
+        assert again[0] == pytest.approx(first[1]) and again[1] == pytest.approx(first[0])
     finally:
         embedder.close()

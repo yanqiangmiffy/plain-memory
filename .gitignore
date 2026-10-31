@@ -41,3 +41,7 @@ eval/.cache/
 eval/.run/
 eval/results/*/*/*.log
 reference
+examples/gpt-4o-mini-api.py
+examples/text-embedding-v4-api.py
+
+examples
